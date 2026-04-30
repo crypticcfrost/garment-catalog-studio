@@ -27,6 +27,66 @@ app.add_middleware(
 manager = ConnectionManager()
 sessions: dict[str, Session] = {}
 
+
+# ── Session persistence helpers ───────────────────────────────────────────────
+
+def _manifest_path(session_id: str) -> Path:
+    return UPLOAD_DIR / session_id / "_session.json"
+
+
+def _save_session_manifest(session: Session) -> None:
+    """Write a lightweight manifest so sessions survive hot-reloads / restarts."""
+    try:
+        data = {
+            "id": session.id,
+            "status": session.status if session.status != "processing" else "idle",
+            "images": {
+                img_id: {
+                    "id": img.id,
+                    "filename": img.filename,
+                    "original_path": img.original_path,
+                }
+                for img_id, img in session.images.items()
+            },
+        }
+        _manifest_path(session.id).write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass  # non-fatal
+
+
+def _restore_sessions() -> None:
+    """On startup, rebuild in-memory sessions from any manifests on disk."""
+    for session_dir in UPLOAD_DIR.iterdir():
+        if not session_dir.is_dir():
+            continue
+        manifest = session_dir / "_session.json"
+        if not manifest.exists():
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            sid = data["id"]
+            if sid in sessions:
+                continue  # already loaded
+            session = Session(id=sid)
+            session.status = data.get("status", "idle")
+            for img_id, img_data in data.get("images", {}).items():
+                path = img_data.get("original_path", "")
+                if path and Path(path).exists():
+                    session.images[img_id] = ImageItem(
+                        id=img_data["id"],
+                        filename=img_data["filename"],
+                        original_path=path,
+                    )
+            if session.images:          # only restore if images are still on disk
+                sessions[sid] = session
+        except Exception:
+            pass
+
+
+@app.on_event("startup")
+async def _on_startup():
+    _restore_sessions()
+
 ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
 
 
@@ -46,6 +106,22 @@ async def create_session():
 async def get_session(session_id: str):
     s = _get_session(session_id)
     return JSONResponse(json.loads(s.model_dump_json()))
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    """Return all active sessions so the frontend can reconnect after a page reload."""
+    return {
+        "sessions": [
+            {
+                "session_id": sid,
+                "status":     s.status,
+                "images":     len(s.images),
+                "groups":     len(s.groups),
+            }
+            for sid, s in sessions.items()
+        ]
+    }
 
 
 @app.get("/api/sessions/{session_id}/status")
@@ -99,6 +175,7 @@ async def upload_images(session_id: str, files: List[UploadFile] = File(...)):
             "thumbnail": f"/uploads/{session_id}/{fname}",
         })
 
+    _save_session_manifest(s)   # persist so a hot-reload doesn't lose the upload
     return {"uploaded": uploaded, "total": len(s.images)}
 
 

@@ -50,6 +50,13 @@ class ImageItem(BaseModel):
     error_message: Optional[str] = None
     description: Optional[str] = None
     colors: Optional[List[str]] = Field(default_factory=list)
+    # Structured attributes extracted during classification (used as grouping constraints)
+    collar_type: Optional[str] = None
+    sleeve_length: Optional[str] = None
+    body_length: Optional[str] = None
+    fit: Optional[str] = None
+    texture: Optional[str] = None
+    distinctive_features: Optional[List[str]] = Field(default_factory=list)
     retry_count: int = 0
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
 

@@ -89,14 +89,13 @@ async def _step_classify(session: Session, manager: ConnectionManager):
                 "front": ImageType.FRONT, "back": ImageType.BACK,
                 "detail": ImageType.DETAIL, "spec_label": ImageType.SPEC_LABEL,
             }
-            img.image_type = type_map.get(result.get("image_type", ""), ImageType.UNKNOWN)
+            img.image_type  = type_map.get(result.get("image_type", ""), ImageType.UNKNOWN)
             img.style_id    = result.get("style_id")
             img.confidence  = result.get("confidence", 0.0)
-            # Normalise color field — classifier now returns primary_color/secondary_color
-            primary   = result.get("primary_color") or ""
-            secondary = result.get("secondary_color") or ""
-            img.colors = [c for c in [primary, secondary] if c]
-            img.description = result.get("key_features") or result.get("description", "")
+            primary         = result.get("primary_color") or ""
+            secondary       = result.get("secondary_color") or ""
+            img.colors      = [c for c in [primary, secondary] if c]
+            img.description = result.get("key_features") or ""
             img.garment_data = GarmentData(
                 garment_type=result.get("garment_type"),
                 reference_number=result.get("style_id"),
@@ -136,15 +135,14 @@ async def _step_group(session: Session, manager: ConnectionManager):
 
     summaries = [
         {
-            "id":              img_id,
-            "path":            img.original_path,          # ← image path for visual comparison
-            "image_type":      img.image_type.value if img.image_type else "unknown",
-            "style_id":        img.style_id,
-            "garment_type":    img.garment_data.garment_type if img.garment_data else None,
-            "primary_color":   img.colors[0] if img.colors else None,
-            "secondary_color": img.colors[1] if len(img.colors) > 1 else None,
-            "key_features":    img.description or "",
-            "colors":          img.colors or [],
+            "id":           img_id,
+            "path":         img.original_path,
+            "image_type":   img.image_type.value if img.image_type else "unknown",
+            "style_id":     img.style_id,
+            "garment_type": img.garment_data.garment_type if img.garment_data else None,
+            "primary_color": img.colors[0] if img.colors else None,
+            "key_features": img.description or "",
+            "colors":       img.colors or [],
         }
         for img_id, img in session.images.items()
     ]
