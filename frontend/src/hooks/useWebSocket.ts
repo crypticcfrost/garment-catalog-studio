@@ -7,20 +7,24 @@ const WS_BASE = import.meta.env.DEV
   : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
 
 export function useWebSocket(sessionId: string | null) {
-  const ws = useRef<WebSocket | null>(null)
+  const ws             = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const store = useAppStore()
+  const generation     = useRef(0)   // incremented on every cleanup; stale closures check this
+  const store          = useAppStore()
 
   const connect = useCallback(() => {
     if (!sessionId) return
+    // Don't create a duplicate if we're already open to the right session
     if (ws.current?.readyState === WebSocket.OPEN) return
+    // Don't connect to a CONNECTING socket either — wait for it
+    if (ws.current?.readyState === WebSocket.CONNECTING) return
 
+    const myGen = ++generation.current
     const socket = new WebSocket(`${WS_BASE}/${sessionId}`)
     ws.current = socket
 
     socket.onopen = () => {
       store.addLog('Connected to pipeline', 'success')
-      // Heartbeat
       const hb = setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: 'ping' }))
@@ -35,24 +39,49 @@ export function useWebSocket(sessionId: string | null) {
         const event = JSON.parse(e.data)
         handleEvent(event, store)
       } catch {
-        // ignore malformed
+        // ignore malformed frames
       }
     }
 
     socket.onerror = () => {
-      store.addLog('WebSocket error — reconnecting…', 'warning')
+      store.addLog('WebSocket error — will retry…', 'warning')
     }
 
     socket.onclose = () => {
-      reconnectTimer.current = setTimeout(connect, 3000)
+      // Only schedule a reconnect when this connection is still the active one.
+      // If generation changed it means the hook cleaned up intentionally
+      // (session changed / component unmounted) — do NOT reconnect in that case.
+      if (generation.current === myGen) {
+        reconnectTimer.current = setTimeout(connect, 3000)
+      }
     }
   }, [sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    // Invalidate any previously scheduled reconnect from the old session
+    generation.current++
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current)
+      reconnectTimer.current = null
+    }
+    // Close any existing socket cleanly before opening a new one
+    if (ws.current && ws.current.readyState !== WebSocket.CLOSED) {
+      ws.current.onclose = null   // detach handler so it doesn't fire another reconnect
+      ws.current.close()
+    }
+
     connect()
+
     return () => {
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
-      ws.current?.close()
+      generation.current++   // invalidate current generation on unmount / session change
+      if (reconnectTimer.current) {
+        clearTimeout(reconnectTimer.current)
+        reconnectTimer.current = null
+      }
+      if (ws.current) {
+        ws.current.onclose = null  // prevent a reconnect attempt after intentional close
+        ws.current.close()
+      }
     }
   }, [connect])
 }

@@ -1,21 +1,24 @@
 """
-Garment Image Classifier — Anchor-based whole-context visual grouping
+Garment Image Classifier — Clean, visual-first grouping.
 
-Core design principles:
-  1. NO text-description-based grouping anywhere in the main path.
-     Grouping is done purely by sending pixel data to the vision model.
+Design principles:
+  1. classify_image()        – lightweight per-image type detection only.
+                               Returns image_type, garment_type, primary_color, key_features.
+                               NO complex structured attributes – they introduce more errors than
+                               they prevent when used as hard constraints.
 
-  2. SINGLE CALL for small batches (≤ SINGLE_CALL_LIMIT):
-     All garment images are sent together so the model has full context.
+  2. visual_group_batch()    – sends ALL garment thumbnails in ONE call so the model can compare
+                               every pair simultaneously (the key to avoiding context-loss).
+                               Prompt is direct and simple: no attribute labels, no "hard rules"
+                               that override visual evidence.
 
-  3. ANCHOR-BASED CHUNKING for large batches (> SINGLE_CALL_LIMIT):
-     - Process the first chunk → establish initial style groups.
-     - Every subsequent chunk includes one ANCHOR thumbnail per existing group.
-     - Anchors give the model a visual reference: "does this new image match ANCHOR-A?"
-     - This eliminates the cross-batch context-loss problem.
+  3. _anchor_chunked_group() – for > SINGLE_CALL_LIMIT images, keeps anchor thumbnails from
+                               confirmed groups to maintain cross-batch continuity.
 
-  4. Spec labels are NEVER sent to the visual grouper.
-     They are assigned deterministically: reference-number match → upload-order proximity.
+  4. group_images()          – orchestrates: A) visual group garments, B) assign spec labels,
+                               C) coverage check.
+
+  Spec labels are NEVER sent to the visual grouper; they are assigned deterministically.
 """
 
 import asyncio
@@ -35,35 +38,30 @@ HEADERS = {
     "X-Title": "Garment Catalog Studio",
 }
 
-MIME_MAP = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".png": "image/png",  ".webp": "image/webp"}
-
-# ── Tuning constants ──────────────────────────────────────────────────────────
-SINGLE_CALL_LIMIT  = 20   # ≤ this → one API call with all images
-CHUNK_SIZE         = 12   # garment images per chunk (anchor-based mode)
-MAX_ANCHORS        = 6    # anchor images included per chunk call
-THUMB_GARMENT      = 640  # px – thumbnail size for garment images
-THUMB_ANCHOR       = 384  # px – smaller thumbnail for anchor images
-MAX_RETRIES        = 2    # retry attempts on vision API failure
+# ── Tuning ────────────────────────────────────────────────────────────────────
+SINGLE_CALL_LIMIT = 20   # ≤ this → one API call with all images
+CHUNK_SIZE        = 14   # garment images per chunk (anchor mode)
+MAX_ANCHORS       = 5    # anchor images per chunk call
+THUMB_PX          = 768  # thumbnail size – enough detail, not too heavy
+MAX_RETRIES       = 2
 
 
-# ── Image encoding ────────────────────────────────────────────────────────────
+# ── Image helpers ─────────────────────────────────────────────────────────────
 
-def _thumb(path: str, max_px: int) -> tuple[str, str]:
-    """Open image, resize to fit max_px on longest side, return (base64, mime)."""
+def _make_thumb(path: str, max_px: int = THUMB_PX) -> tuple[str, str]:
     img = PILImage.open(path).convert("RGB")
     img.thumbnail((max_px, max_px), PILImage.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=82)
+    img.save(buf, format="JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
 
 
-def _img_block(path: str, max_px: int) -> dict:
-    b64, mime = _thumb(path, max_px)
+def _img_part(path: str, max_px: int = THUMB_PX) -> dict:
+    b64, mime = _make_thumb(path, max_px)
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
 
 
-def _clean_json(text: str) -> str:
+def _strip_json(text: str) -> str:
     text = text.strip()
     if "```" in text:
         s = text.find("{")
@@ -73,8 +71,7 @@ def _clean_json(text: str) -> str:
     return text
 
 
-async def _call_vision(content: list, max_tokens: int = 2000) -> dict:
-    """Wrapper with retry logic around the OpenRouter vision endpoint."""
+async def _call(content: list, max_tokens: int = 2000, temp: float = 0.0) -> dict:
     last_err = None
     for attempt in range(MAX_RETRIES + 1):
         try:
@@ -86,83 +83,55 @@ async def _call_vision(content: list, max_tokens: int = 2000) -> dict:
                         "model": VISION_MODEL,
                         "messages": [{"role": "user", "content": content}],
                         "max_tokens": max_tokens,
-                        "temperature": 0.0,
+                        "temperature": temp,
                     },
                 )
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"].strip()
-            return json.loads(_clean_json(raw))
+            return json.loads(_strip_json(raw))
         except Exception as e:
             last_err = e
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(2 ** attempt)
-    raise RuntimeError(f"Vision API failed after {MAX_RETRIES} retries: {last_err}")
+    raise RuntimeError(f"Vision API failed: {last_err}")
 
 
 # ── 1. Per-image classification ───────────────────────────────────────────────
 
-async def classify_image(image_path: str) -> dict:
-    """
-    Classify a single garment image.
-    Returns: image_type, style_id, garment_type, primary_color, key_features, confidence.
-    """
-    try:
-        b64, mime = _thumb(image_path, THUMB_GARMENT)
-    except Exception as e:
-        return _empty_cls(f"Read error: {e}")
+_CLS_PROMPT = """You are classifying a single garment image for a catalog system.
 
-    prompt = """You are a garment catalog specialist. Classify this image precisely.
-
-Respond ONLY with valid JSON (no markdown fences, no explanation):
+Respond ONLY with valid JSON (no markdown, no explanation):
 {
-  "image_type": "front | back | detail | spec_label | unknown",
-  "style_id": "<ref/style/article code visible in the image, or null>",
-  "garment_type": "<t-shirt | shirt | polo | jeans | dress | jacket | hoodie | pants | shorts | skirt | coat | sweatshirt | cardigan | blazer | vest | etc.>",
-  "primary_color": "<dominant colour: white | off-white | cream | black | navy | red | grey | beige | tan | khaki | blue | green | olive | brown | pink | purple | yellow | orange | teal | multicolor | striped | checked | printed>",
-  "secondary_color": "<second colour if present, else null>",
-  "key_features": "<5-7 precise visual identifiers, e.g. 'boxy crew-neck t-shirt, wide raglan sleeves in navy, front graphic print of golfer figure, white body, no buttons, ribbed cuffs'>",
-  "confidence": <0.0–1.0>,
-  "reasoning": "<one concise sentence>"
+  "image_type": "<one of: front | back | detail | spec_label | unknown>",
+  "style_id": "<reference/article code visible in the image, or null>",
+  "garment_type": "<t-shirt | shirt | polo | hoodie | sweatshirt | jacket | jeans | pants | shorts | dress | skirt | coat | cardigan | vest | other>",
+  "primary_color": "<dominant colour name>",
+  "secondary_color": "<second colour or null>",
+  "key_features": "<2-3 most visually distinctive details, e.g. navy raglan sleeves, golf graphic print, crew neck>",
+  "confidence": <0.0 to 1.0>
 }
 
-━━ TYPE DEFINITIONS — READ CAREFULLY ━━
+TYPE GUIDE:
+  front       – front panel of garment faces camera (chest, buttons, front print visible)
+  back        – rear panel faces camera; this is the SAME garment as its matching front
+  detail      – extreme close-up of one feature only (fabric, seam, button) — whole garment not visible
+  spec_label  – paper/card hang tag, spec sheet, or barcode label; NOT the garment itself
+  unknown     – completely unrecognisable or totally blurry image; use sparingly
 
-front
-  • The FRONT panel of a garment faces the camera.
-  • Garment is on a hanger, flat-lay, mannequin, or worn — does not matter.
-  • If you can see chest / collar / front buttons / front print → it is FRONT.
+RULE: If you can see any garment at all, classify it as front/back/detail — not unknown.
+RULE: Back views are the same physical garment as their front. They share garment_type and color."""
 
-back
-  • The BACK panel faces the camera. Rear seam, back yoke, or back print visible.
-  • A back view is the SAME physical garment as its matching front. They are ONE style.
 
-detail
-  • Extreme close-up of ONE feature: fabric weave, seam, embroidery, zipper, button, tag sewn INTO the garment.
-  • The whole garment is NOT visible — only a small section.
-
-spec_label
-  • A paper hang-tag, printed spec sheet, barcode sticker, or care label CARD.
-  • The garment itself is NOT the main subject.
-  • Key indicator: printed text with reference numbers, barcodes, fabric composition %.
-
-unknown
-  • Use ONLY when the image is completely blurry, corrupt, or contains NO garment at all.
-  • If ANY garment is visible — even partially — classify it as front/back/detail, NOT unknown.
-  • DO NOT use unknown just because you are uncertain between front and back.
-
-━━ DECISION RULES ━━
-1. Can you see the full garment front? → front
-2. Can you see the full garment back? → back
-3. Can you see only a small section of fabric/seam? → detail
-4. Is it a paper/card label with barcodes or spec text? → spec_label
-5. Is the image completely unusable? → unknown (last resort only)
-
-IMPORTANT: "unknown" should be extremely rare — less than 5% of images in a real catalog."""
+async def classify_image(image_path: str) -> dict:
+    try:
+        b64, mime = _make_thumb(image_path, THUMB_PX)
+    except Exception as e:
+        return _empty_cls(str(e))
 
     try:
         content = [
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-            {"type": "text", "text": prompt},
+            {"type": "text", "text": _CLS_PROMPT},
         ]
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
@@ -171,13 +140,13 @@ IMPORTANT: "unknown" should be extremely rare — less than 5% of images in a re
                 json={
                     "model": VISION_MODEL,
                     "messages": [{"role": "user", "content": content}],
-                    "max_tokens": 500,
+                    "max_tokens": 300,
                     "temperature": 0.0,
                 },
             )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
-        return json.loads(_clean_json(raw))
+        return json.loads(_strip_json(raw))
     except Exception as e:
         return _empty_cls(str(e))
 
@@ -186,63 +155,49 @@ def _empty_cls(reason: str) -> dict:
     return {
         "image_type": "unknown", "style_id": None, "garment_type": None,
         "primary_color": None, "secondary_color": None,
-        "key_features": "", "colors": [], "confidence": 0.0, "reasoning": reason,
+        "key_features": "", "confidence": 0.0,
     }
 
 
-# ── 2. Visual grouping — single call ─────────────────────────────────────────
+# ── 2. Visual grouping (single call) ─────────────────────────────────────────
 
-_PROMPT_FULL = """You are a garment catalog specialist. You are looking at {n} garment images labeled [Img 1] … [Img {n}].
+_GROUP_PROMPT = """You are a garment catalog expert. You are looking at {n} garment photos, numbered [1] through [{n}].
 
-━━ YOUR TASK ━━
-Group the images so that all images of the **same physical garment** are in one group.
-Every image must appear in exactly one group — no image may be left out.
+TASK: Group the photos so that every photo of the SAME physical garment is in the same group.
 
-━━ WHAT COUNTS AS "SAME GARMENT" ━━
-All of these belong in ONE group for the SAME garment:
-  • Front view on hanger
-  • Back view on hanger           ← SAME garment, different angle
-  • Second front view (flat-lay, different angle, or duplicate shot)  ← STILL same garment
-  • Close-up detail of the fabric or seam
-  • Any additional angle of the same item
-Typical group size: 2–5 images. Groups of 1 are allowed (only one shot exists).
+WHAT IS ONE GROUP:
+  • Front view + back view of the same garment → ONE group (same item, different angle)
+  • 2 or 3 front shots of the same garment (different angles or lighting) → ONE group
+  • Detail close-ups of the same garment → same group as its front/back
+  • Typical group size: 2–4 images. A group of 1 is fine if only one shot exists.
 
-━━ RULES FOR "DIFFERENT GARMENTS" ━━
-These MUST be in SEPARATE groups even if they look similar:
+WHAT IS A DIFFERENT GROUP:
+  Look carefully at the physical garment construction and design:
+  • Different collar style (e.g. polo collar vs crew neck vs button-down) → separate groups
+  • Different colour (even similar shades like off-white vs cream → separate if clearly different)
+  • Different sleeve length (short vs long) → separate groups
+  • Different print or pattern → separate groups
+  • Different overall garment design → separate groups
+  Garments that are the same TYPE and COLOR but have different construction = different groups.
 
-  SOLID / NEAR-SOLID GARMENTS (white, cream, black, grey, etc.) — this is the hardest case:
-  ① Collar/neckline: crew-neck ≠ v-neck ≠ polo-collar ≠ band-collar ≠ open-collar shirt
-  ② Sleeve length: sleeveless ≠ short-sleeve ≠ 3/4-sleeve ≠ long-sleeve
-  ③ Body length: crop ≠ regular ≠ longline — even a few centimetres difference = different style
-  ④ Fit silhouette: boxy/oversized ≠ slim-fit ≠ relaxed — if the shoulder drop or body taper differs
-  ⑤ Construction details: ribbed cuffs ≠ plain cuffs; side slits ≠ no slits; chest pocket ≠ no pocket
-  ⑥ Fabric surface: waffle/textured knit ≠ smooth jersey ≠ structured woven
-  ⑦ Colour shade: pure white ≠ off-white/cream ≠ light grey — if the shade is visibly different
+SPECIAL CASE — white/light solid garments:
+  These are visually similar. Compare collar and sleeve carefully.
+  A plain crew-neck tee and a polo-collar tee are DIFFERENT garments even if both white.
 
-  PATTERNED GARMENTS:
-  ⑧ Stripe spacing or rhythm: narrow stripes ≠ wide stripes even if same colours
-  ⑨ Pattern scale: small check ≠ large check
-  ⑩ Print content: any difference in print motif = different garment
-
-NEVER merge two garments just because they share garment type and general colour.
-When in doubt about solid garments, CHECK the collar and sleeve details — those are the most reliable differentiators.
-
-━━ RESPOND ━━
-ONLY valid JSON — no markdown, no explanation outside the JSON:
+OUTPUT — only valid JSON, no markdown:
 {{
   "groups": [
-    {{"style_id": "STYLE-001", "garment_type": "t-shirt", "image_numbers": [1, 3, 5]}},
-    {{"style_id": "STYLE-002", "garment_type": "shirt",   "image_numbers": [2, 4, 6, 8]}}
+    {{"style_id": "STYLE-001", "garment_type": "t-shirt", "image_numbers": [1, 4, 7]}},
+    {{"style_id": "STYLE-002", "garment_type": "polo",    "image_numbers": [2, 5, 8]}}
   ]
 }}
 
-Every image number from 1 to {n} must appear in exactly one group."""
+Every number from 1 to {n} must appear in exactly one group."""
 
 
 async def visual_group_batch(image_infos: list[dict]) -> list[dict]:
     """
-    Sends all garment images in one API call for visual grouping.
-    image_infos: list of {id, path, image_type, style_id, garment_type, ...}
+    Send all garment images in one call. No attribute labels — pure visual comparison.
     """
     if not image_infos:
         return []
@@ -253,44 +208,44 @@ async def visual_group_batch(image_infos: list[dict]) -> list[dict]:
                  "image_ids": [info["id"]]}]
 
     content: list[dict] = []
-    valid: list[tuple[int, dict]] = []  # (image_number, info)
+    valid: list[tuple[int, dict]] = []
 
     for i, info in enumerate(image_infos, start=1):
         path = info.get("path", "")
         if not path or not Path(path).exists():
             continue
         try:
-            content.append(_img_block(path, THUMB_GARMENT))
+            content.append(_img_part(path))
         except Exception:
             continue
-        hint = f" ref={info['style_id']!r}" if info.get("style_id") else ""
-        content.append({"type": "text",
-                         "text": f"[Img {i}: id={info['id']} type={info.get('image_type','?')}{hint}]"})
+        # Minimal label — just the number and view type (no attributes that could mislead)
+        view = info.get("image_type", "?")
+        content.append({"type": "text", "text": f"[Photo {i} — view: {view}]"})
         valid.append((i, info))
 
     if not valid:
-        return _upload_order_fallback(image_infos)
+        return _order_fallback(image_infos)
 
-    content.append({"type": "text", "text": _PROMPT_FULL.format(n=len(valid))})
+    content.append({"type": "text", "text": _GROUP_PROMPT.format(n=len(valid))})
 
     try:
-        data = await _call_vision(content, max_tokens=2000)
-        num_to_info = {num: info for num, info in valid}
+        data = await _call(content, max_tokens=2000)
+        num_map = {num: info for num, info in valid}
         groups: list[dict] = []
         used: set[int] = set()
 
-        for grp in data.get("groups", []):
-            nums = [int(n) for n in grp.get("image_numbers", []) if str(n).isdigit()]
-            ids  = [num_to_info[n]["id"] for n in nums if n in num_to_info]
+        for g in data.get("groups", []):
+            nums = [int(x) for x in g.get("image_numbers", []) if str(x).isdigit()]
+            ids  = [num_map[n]["id"] for n in nums if n in num_map]
             if ids:
                 groups.append({
-                    "style_id":    grp.get("style_id") or f"STYLE-{len(groups)+1:03d}",
-                    "garment_type": grp.get("garment_type"),
+                    "style_id":    g.get("style_id") or f"STYLE-{len(groups)+1:03d}",
+                    "garment_type": g.get("garment_type"),
                     "image_ids":   ids,
                 })
                 used.update(nums)
 
-        # Recover any image the model missed
+        # Recover any image the model omitted
         ctr = len(groups) + 1
         for num, info in valid:
             if num not in used:
@@ -300,121 +255,95 @@ async def visual_group_batch(image_infos: list[dict]) -> list[dict]:
                     "image_ids":   [info["id"]],
                 })
                 ctr += 1
+
         return groups
 
     except Exception:
-        return _upload_order_fallback(image_infos)
+        return _order_fallback(image_infos)
 
 
 # ── 3. Anchor-based chunking for large batches ────────────────────────────────
 
-_PROMPT_ANCHOR = """You are a garment catalog specialist comparing NEW images against ANCHOR reference images.
+_ANCHOR_PROMPT = """You are a garment catalog expert. Compare NEW garment photos against ANCHOR reference photos.
 
-ANCHOR images = already confirmed styles. Each anchor thumbnail represents one known style.
-NEW images = must be assigned to an existing anchor style OR declared a brand-new style.
+ANCHOR photos = confirmed reference images, each from a known style group.
+NEW photos = need to be assigned to an existing style OR identified as a new style.
 
-━━ IMAGES ━━
-ANCHORS (already classified):
-{anchor_descriptions}
+ANCHOR images:
+{anchor_lines}
 
-NEW images to classify:
-{new_descriptions}
+NEW images to assign:
+{new_lines}
 
-━━ HOW TO MATCH ━━
-A NEW image MATCHES an anchor when it shows the SAME physical garment:
-  • Same exact collar/neckline type
-  • Same sleeve length
-  • Same colour shade (pure white ≠ cream ≠ off-white)
-  • Same fabric texture
-  • Same construction (pocket, slit, cuff, silhouette)
-  • A front view CAN match a back-view anchor — they are the same garment
-  • A SECOND front view CAN match a front-view anchor — same garment, extra shot
+TASK: For each NEW photo, decide:
+  • Does it show the SAME physical garment as one of the ANCHORS?
+    → Same means: same collar, same colour, same sleeve, same design. Front/back of same garment = match.
+  • If it matches an ANCHOR → assign to that anchor's style_id
+  • If it matches NO anchor → it is a new style
 
-A NEW image does NOT match when even ONE of these differs:
-  • Different collar (crew ≠ polo ≠ v-neck ≠ band collar)
-  • Different sleeve length
-  • Different body length or silhouette
-  • Visibly different colour shade
-
-━━ RESPOND ━━
-ONLY valid JSON (no markdown, no extra text):
+OUTPUT — only valid JSON, no markdown:
 {{
   "assignments": [
-    {{"img_num": 5, "anchor_style_id": "STYLE-001"}},
-    {{"img_num": 6, "anchor_style_id": null, "new_style_id": "STYLE-005", "garment_type": "polo"}}
+    {{"img_num": 3, "anchor_style_id": "STYLE-001"}},
+    {{"img_num": 4, "anchor_style_id": null, "new_style_id": "STYLE-006", "garment_type": "polo"}}
   ]
 }}
 
-Every NEW img_num must appear exactly once in the assignments list."""
+Every NEW img_num must appear exactly once."""
 
 
 async def _anchor_chunked_group(items: list[dict]) -> list[dict]:
-    """
-    Groups > SINGLE_CALL_LIMIT garment images using anchor-based chunking.
-
-    Algorithm:
-      1. Form initial groups from the first CHUNK_SIZE images.
-      2. For each subsequent chunk:
-           a. Pick one representative (anchor) image from each existing group.
-           b. Send anchors + chunk to vision model.
-           c. Model assigns each new image to an existing group OR declares a new group.
-      3. Accumulate all groups.
-    """
-    # Step 1: initial groups from first chunk
-    first_chunk = items[:CHUNK_SIZE]
-    groups = await visual_group_batch(first_chunk)
+    """Process > SINGLE_CALL_LIMIT garment images with anchor-based continuity."""
+    # Initial groups from first chunk
+    first = items[:CHUNK_SIZE]
+    groups = await visual_group_batch(first)
     processed = {iid for g in groups for iid in g["image_ids"]}
-
-    # Step 2: anchor-based processing of remaining items
     remaining = [i for i in items if i["id"] not in processed]
 
     while remaining:
-        chunk      = remaining[:CHUNK_SIZE]
-        remaining  = remaining[CHUNK_SIZE:]
+        chunk     = remaining[:CHUNK_SIZE]
+        remaining = remaining[CHUNK_SIZE:]
 
-        # Build anchor list: one image per existing group (use first image in group)
+        # Build anchors: one confirmed image per existing group
         anchors: list[dict] = []
         for g in groups:
             for aid in g["image_ids"]:
-                anchor_item = next((x for x in items if x["id"] == aid), None)
-                if anchor_item and Path(anchor_item.get("path", "")).exists():
-                    anchors.append({**anchor_item,
-                                    "_anchor_style": g["style_id"],
-                                    "_anchor_gtype":  g.get("garment_type")})
+                anchor = next((x for x in items if x["id"] == aid), None)
+                if anchor and Path(anchor.get("path", "")).exists():
+                    anchors.append({**anchor,
+                                    "_style": g["style_id"],
+                                    "_gtype": g.get("garment_type")})
                     break
             if len(anchors) >= MAX_ANCHORS:
                 break
 
-        assignments = await _call_with_anchors(anchors, chunk)
-
-        # Merge assignments into existing groups
+        assignments = await _run_anchor_call(anchors, chunk)
         ctr = len(groups) + 1
+
         for asgn in assignments:
-            img_num = asgn.get("img_num")
-            if img_num is None or img_num > len(chunk):
+            num = asgn.get("img_num")
+            if num is None or num < 1 or num > len(chunk):
                 continue
-            new_item = chunk[img_num - 1]
-            matched_style = asgn.get("anchor_style_id")
-
-            if matched_style:
-                target = next((g for g in groups if g["style_id"] == matched_style), None)
+            item = chunk[num - 1]
+            sid  = asgn.get("anchor_style_id")
+            if sid:
+                target = next((g for g in groups if g["style_id"] == sid), None)
                 if target:
-                    target["image_ids"].append(new_item["id"])
+                    target["image_ids"].append(item["id"])
                     continue
-
             # New style
             ns = asgn.get("new_style_id") or f"STYLE-{ctr:03d}"
             groups.append({
                 "style_id":    ns,
-                "garment_type": asgn.get("garment_type") or new_item.get("garment_type"),
-                "image_ids":   [new_item["id"]],
+                "garment_type": asgn.get("garment_type") or item.get("garment_type"),
+                "image_ids":   [item["id"]],
             })
             ctr += 1
 
-        # Safety: ensure nothing from the chunk is lost
-        assigned_ids = {iid for g in groups for iid in g["image_ids"]}
+        # Safety net — ensure nothing from chunk is lost
+        assigned = {iid for g in groups for iid in g["image_ids"]}
         for item in chunk:
-            if item["id"] not in assigned_ids:
+            if item["id"] not in assigned:
                 groups.append({
                     "style_id":    item.get("style_id") or f"STYLE-{ctr:03d}",
                     "garment_type": item.get("garment_type"),
@@ -422,63 +351,49 @@ async def _anchor_chunked_group(items: list[dict]) -> list[dict]:
                 })
                 ctr += 1
 
-        await asyncio.sleep(0.5)  # brief pause between anchor calls
+        await asyncio.sleep(0.4)
 
     return groups
 
 
-async def _call_with_anchors(anchors: list[dict], new_items: list[dict]) -> list[dict]:
-    """
-    Sends anchor images + new images to the vision model.
-    Returns per-image assignment list.
-    """
+async def _run_anchor_call(anchors: list[dict], new_items: list[dict]) -> list[dict]:
     content: list[dict] = []
-    anchor_descs: list[str] = []
-    new_descs:    list[str] = []
+    anchor_lines: list[str] = []
+    new_lines:    list[str] = []
 
-    # Add anchor images
-    for i, a in enumerate(anchors, start=1):
+    for a in anchors:
         try:
-            content.append(_img_block(a["path"], THUMB_ANCHOR))
+            content.append(_img_part(a["path"], 512))
         except Exception:
             continue
-        anchor_descs.append(
-            f"  [ANCHOR {i}: style={a['_anchor_style']!r} garment={a.get('_anchor_gtype','?')}]"
-        )
-        content.append({"type": "text", "text": f"[ANCHOR {i}: style_id={a['_anchor_style']!r}]"})
+        anchor_lines.append(f"  ANCHOR style={a['_style']!r} garment={a.get('_gtype','?')!r}")
+        content.append({"type": "text", "text": f"[ANCHOR: style={a['_style']!r}]"})
 
-    # Add new images
     for j, item in enumerate(new_items, start=1):
         path = item.get("path", "")
         if not path or not Path(path).exists():
-            new_descs.append(f"  [NEW img_num={j} id={item['id']} — IMAGE UNAVAILABLE]")
             continue
         try:
-            content.append(_img_block(path, THUMB_GARMENT))
+            content.append(_img_part(path))
         except Exception:
             continue
-        hint = f" ref={item['style_id']!r}" if item.get("style_id") else ""
-        new_descs.append(f"  [NEW img_num={j} id={item['id']} type={item.get('image_type','?')}{hint}]")
-        content.append({"type": "text", "text": f"[NEW img_num={j} id={item['id']}]"})
+        new_lines.append(f"  NEW img_num={j}")
+        content.append({"type": "text", "text": f"[NEW img_num={j}]"})
 
-    if not new_descs:
+    if not new_lines:
         return []
 
-    content.append({
-        "type": "text",
-        "text": _PROMPT_ANCHOR.format(
-            anchor_descriptions="\n".join(anchor_descs) or "  (none)",
-            new_descriptions="\n".join(new_descs),
-        ),
-    })
+    content.append({"type": "text", "text": _ANCHOR_PROMPT.format(
+        anchor_lines="\n".join(anchor_lines) or "  (none)",
+        new_lines="\n".join(new_lines),
+    )})
 
     try:
-        data = await _call_vision(content, max_tokens=1500)
+        data = await _call(content, max_tokens=1200)
         return data.get("assignments", [])
     except Exception:
-        # If anchor call fails, treat all new items as new styles
-        return [{"img_num": j + 1, "anchor_style_id": None,
-                 "new_style_id": None, "garment_type": item.get("garment_type")}
+        return [{"img_num": j + 1, "anchor_style_id": None, "new_style_id": None,
+                 "garment_type": item.get("garment_type")}
                 for j, item in enumerate(new_items)]
 
 
@@ -489,8 +404,8 @@ async def group_images(
     upload_order: list[str] | None = None,
 ) -> dict:
     """
-    Three-phase grouping (purely visual — no text descriptions used for grouping):
-      A: Visual grouping of garment images (single call or anchor-chunked)
+    Three-phase pipeline:
+      A: Visual grouping of garment images
       B: Deterministic spec-label assignment
       C: Coverage check
     """
@@ -500,20 +415,20 @@ async def group_images(
     garment_items = [i for i in image_summaries if i.get("image_type") != "spec_label"]
     spec_items    = [i for i in image_summaries if i.get("image_type") == "spec_label"]
 
-    # Phase A — visual grouping
-    if len(garment_items) == 0:
+    # Phase A
+    if not garment_items:
         raw_groups: list[dict] = []
     elif len(garment_items) <= SINGLE_CALL_LIMIT:
         raw_groups = await visual_group_batch(garment_items)
     else:
         raw_groups = await _anchor_chunked_group(garment_items)
 
-    # Phase B — spec label assignment
+    # Phase B
     upload_order = upload_order or [i["id"] for i in image_summaries]
     raw_groups = _assign_spec_labels(spec_items, raw_groups, upload_order, image_summaries)
 
-    # Phase C — coverage
-    raw_groups = _ensure_complete_coverage(raw_groups, image_summaries)
+    # Phase C
+    raw_groups = _ensure_coverage(raw_groups, image_summaries)
 
     return {"groups": raw_groups}
 
@@ -526,61 +441,54 @@ def _assign_spec_labels(
     upload_order: list[str],
     all_items: list[dict],
 ) -> list[dict]:
-    """
-    Assigns each spec_label image to a garment group.
-    Priority:
-      1. Reference-number match (spec style_id == group style_id)
-      2. Upload-order proximity (label was uploaded near the garment)
-      3. Standalone fallback
-    """
     if not spec_items:
         return garment_groups
 
     groups = [dict(g, image_ids=list(g["image_ids"])) for g in garment_groups]
 
     for spec in spec_items:
-        spec_id  = spec["id"]
+        sid      = spec["id"]
         spec_ref = (spec.get("style_id") or "").strip().lower()
-        assigned = False
+        placed   = False
 
-        # 1. Reference number match
+        # 1. Reference-number match
         if spec_ref:
             for grp in groups:
                 if grp.get("style_id", "").strip().lower() == spec_ref:
-                    grp["image_ids"].append(spec_id)
-                    assigned = True
+                    grp["image_ids"].append(sid)
+                    placed = True
                     break
-            if not assigned:
+            if not placed:
                 for grp in groups:
                     for iid in grp.get("image_ids", []):
                         item = next((x for x in all_items if x["id"] == iid), None)
                         if item and (item.get("style_id") or "").strip().lower() == spec_ref:
-                            grp["image_ids"].append(spec_id)
-                            assigned = True
+                            grp["image_ids"].append(sid)
+                            placed = True
                             break
-                    if assigned:
+                    if placed:
                         break
 
         # 2. Upload-order proximity
-        if not assigned and spec_id in upload_order:
-            spec_pos = upload_order.index(spec_id)
+        if not placed and sid in upload_order:
+            pos  = upload_order.index(sid)
             best, dist = None, float("inf")
             for grp in groups:
                 for iid in grp.get("image_ids", []):
                     if iid in upload_order:
-                        d = abs(upload_order.index(iid) - spec_pos)
+                        d = abs(upload_order.index(iid) - pos)
                         if d < dist:
                             dist, best = d, grp
             if best:
-                best["image_ids"].append(spec_id)
-                assigned = True
+                best["image_ids"].append(sid)
+                placed = True
 
-        # 3. Standalone
-        if not assigned:
+        # 3. Standalone fallback
+        if not placed:
             groups.append({
                 "style_id":    spec.get("style_id") or f"SPEC-{len(groups)+1:03d}",
                 "garment_type": None,
-                "image_ids":   [spec_id],
+                "image_ids":   [sid],
             })
 
     return groups
@@ -588,7 +496,7 @@ def _assign_spec_labels(
 
 # ── 6. Coverage check ─────────────────────────────────────────────────────────
 
-def _ensure_complete_coverage(groups: list[dict], all_items: list[dict]) -> list[dict]:
+def _ensure_coverage(groups: list[dict], all_items: list[dict]) -> list[dict]:
     covered = {iid for g in groups for iid in g.get("image_ids", [])}
     ctr = len(groups) + 1
     for item in all_items:
@@ -602,13 +510,10 @@ def _ensure_complete_coverage(groups: list[dict], all_items: list[dict]) -> list
     return groups
 
 
-# ── 7. Pure upload-order fallback (last resort only) ─────────────────────────
+# ── 7. Last-resort fallback ───────────────────────────────────────────────────
 
-def _upload_order_fallback(items: list[dict]) -> list[dict]:
-    """
-    Used ONLY when ALL vision API calls fail.
-    Groups by upload order in batches of 4 (typical: front+back+detail+spec).
-    """
+def _order_fallback(items: list[dict]) -> list[dict]:
+    """Only used when ALL API calls fail. Groups by upload order in batches of 4."""
     groups = []
     for i in range(0, len(items), 4):
         batch = items[i:i + 4]
