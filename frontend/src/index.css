@@ -1,0 +1,96 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background-color: #080A0F;
+  color: #E8EAF0;
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* Selection */
+::selection {
+  background: rgba(99, 102, 241, 0.35);
+}
+
+/* Dot-grid canvas background */
+.dot-grid {
+  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* Glow utility */
+.glow-accent {
+  box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.3), 0 4px 24px rgba(99, 102, 241, 0.12);
+}
+
+/* Glass card */
+.glass {
+  background: rgba(19, 25, 37, 0.7);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+/* Status pulse ring */
+@keyframes ping-slow {
+  0%   { transform: scale(1);   opacity: 0.6; }
+  80%, 100% { transform: scale(2.2); opacity: 0; }
+}
+.ping-slow {
+  animation: ping-slow 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+/* Confidence bar fill animation */
+@keyframes bar-fill {
+  from { width: 0; }
+}
+.bar-fill {
+  animation: bar-fill 0.8s ease-out forwards;
+}
+
+/* Image card hover lift */
+.img-card {
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+.img-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+/* Drag overlay */
+.dragging {
+  opacity: 0.55;
+  transform: scale(0.97);
+}
