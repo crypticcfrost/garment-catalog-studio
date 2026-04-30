@@ -10,7 +10,7 @@ from models import (
 from ws_manager import ConnectionManager
 from config import OUTPUT_DIR, BATCH_SIZE
 
-from .classifier import classify_image, group_images, _assign_spec_labels
+from .classifier import classify_image, group_images
 from .extractor import extract_spec_data
 from .processor import process_image
 from .ppt_generator import generate_catalog_ppt
@@ -131,12 +131,13 @@ async def _step_group(session: Session, manager: ConnectionManager):
     await _step_start(session, manager, "grouping",
                       "Grouping garments by style; assigning spec labels…")
 
-    # Preserve the upload order for proximity-based spec label assignment
+    # Preserve upload order (critical for spec-label proximity assignment)
     upload_order = list(session.images.keys())
 
     summaries = [
         {
             "id":              img_id,
+            "path":            img.original_path,          # ← image path for visual comparison
             "image_type":      img.image_type.value if img.image_type else "unknown",
             "style_id":        img.style_id,
             "garment_type":    img.garment_data.garment_type if img.garment_data else None,
