@@ -8,16 +8,15 @@ from models import (
     StyleGroup, GarmentData, PipelineStep,
 )
 from ws_manager import ConnectionManager
-from config import OUTPUT_DIR, BATCH_SIZE
+from config import OUTPUT_DIR
 
-from .classifier import classify_image, group_images
+from .classifier import group_images
 from .extractor import extract_spec_data
 from .processor import process_image
 from .ppt_generator import generate_catalog_ppt
 
 
 PIPELINE_STEPS = [
-    ("classification", "Image Classification"),
     ("grouping",       "Style Grouping"),
     ("extraction",     "Spec Extraction"),
     ("processing",     "Image Processing"),
@@ -38,7 +37,6 @@ async def run_pipeline(session: Session, manager: ConnectionManager):
             "steps": session.pipeline_steps,
         })
 
-        await _step_classify(session, manager)
         await _step_group(session, manager)
         await _step_extract(session, manager)
         await _step_process(session, manager)
@@ -56,100 +54,48 @@ async def run_pipeline(session: Session, manager: ConnectionManager):
         await _emit(manager, session.id, "pipeline_error", {"error": str(exc)})
 
 
-# ── Step 1: Classification ────────────────────────────────────────────────────
-
-async def _step_classify(session: Session, manager: ConnectionManager):
-    await _step_start(session, manager, "classification", "Classifying images with AI…")
-    ids = list(session.images.keys())
-    total = len(ids)
-
-    for batch_start in range(0, total, BATCH_SIZE):
-        batch = ids[batch_start: batch_start + BATCH_SIZE]
-
-        for img_id in batch:
-            _update_img(session, img_id, status=ImageStatus.CLASSIFYING)
-            await _emit(manager, session.id, "image_status", {
-                "image_id": img_id, "status": "classifying",
-            })
-
-        tasks = [classify_image(session.images[i].original_path) for i in batch]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for img_id, result in zip(batch, results):
-            img = session.images[img_id]
-            if isinstance(result, Exception):
-                img.status = ImageStatus.ERROR
-                img.error_message = str(result)
-                await _emit(manager, session.id, "image_error", {
-                    "image_id": img_id, "error": str(result),
-                })
-                continue
-
-            type_map = {
-                "front": ImageType.FRONT, "back": ImageType.BACK,
-                "detail": ImageType.DETAIL, "spec_label": ImageType.SPEC_LABEL,
-            }
-            img.image_type  = type_map.get(result.get("image_type", ""), ImageType.UNKNOWN)
-            img.style_id    = result.get("style_id")
-            img.confidence  = result.get("confidence", 0.0)
-            primary         = result.get("primary_color") or ""
-            secondary       = result.get("secondary_color") or ""
-            img.colors      = [c for c in [primary, secondary] if c]
-            img.description = result.get("key_features") or ""
-            img.garment_data = GarmentData(
-                garment_type=result.get("garment_type"),
-                reference_number=result.get("style_id"),
-                colors=img.colors,
-            )
-            img.status = ImageStatus.CLASSIFIED
-
-            await _emit(manager, session.id, "image_classified", {
-                "image_id":     img_id,
-                "image_type":   img.image_type.value,
-                "style_id":     img.style_id,
-                "confidence":   img.confidence,
-                "garment_type": result.get("garment_type"),
-                "primary_color": result.get("primary_color"),
-                "key_features": result.get("key_features"),
-                "colors":       img.colors,
-                "description":  img.description,
-                "status":       "classified",
-            })
-
-        done = min(batch_start + BATCH_SIZE, total)
-        await _step_progress(session, manager, "classification", int(done / total * 100))
-        if batch_start + BATCH_SIZE < total:
-            await asyncio.sleep(0.5)
-
-    await _step_done(session, manager, "classification", "Classification complete")
-
-
-# ── Step 2: Grouping ──────────────────────────────────────────────────────────
+# ── Step 1: Grouping (classification-free) ───────────────────────────────────
+#
+# All uploaded images are sent directly to the visual grouper.
+# The model groups garment photos by physical item AND identifies spec labels
+# in a single pass — no separate classification step needed.
 
 async def _step_group(session: Session, manager: ConnectionManager):
     await _step_start(session, manager, "grouping",
-                      "Grouping garments by style; assigning spec labels…")
+                      "Grouping garments and identifying spec labels…")
 
-    # Preserve upload order (critical for spec-label proximity assignment)
-    upload_order = list(session.images.keys())
-
+    # Build minimal summaries — just path and id; grouper works purely visually
     summaries = [
         {
-            "id":           img_id,
-            "path":         img.original_path,
-            "image_type":   img.image_type.value if img.image_type else "unknown",
-            "style_id":     img.style_id,
-            "garment_type": img.garment_data.garment_type if img.garment_data else None,
-            "primary_color": img.colors[0] if img.colors else None,
-            "key_features": img.description or "",
-            "colors":       img.colors or [],
+            "id":   img_id,
+            "path": img.original_path,
         }
         for img_id, img in session.images.items()
     ]
 
-    grouping = await group_images(summaries, upload_order=upload_order)
-    session.groups = {}
+    grouping = await group_images(summaries)
 
+    # ── Apply view_map: set image_type on every image from grouper output ──────
+    view_map = grouping.get("view_map", {})
+    type_map = {
+        "front":      ImageType.FRONT,
+        "back":       ImageType.BACK,
+        "detail":     ImageType.DETAIL,
+        "spec_label": ImageType.SPEC_LABEL,
+    }
+    for img_id, view in view_map.items():
+        img = session.images.get(img_id)
+        if img:
+            img.image_type = type_map.get(view, ImageType.UNKNOWN)
+            img.status = ImageStatus.CLASSIFIED
+            await _emit(manager, session.id, "image_classified", {
+                "image_id":   img_id,
+                "image_type": img.image_type.value,
+                "status":     "classified",
+            })
+
+    # ── Build style groups ────────────────────────────────────────────────────
+    session.groups = {}
     for raw in grouping.get("groups", []):
         gid = str(uuid.uuid4())[:8]
         g = StyleGroup(
@@ -180,7 +126,7 @@ async def _step_group(session: Session, manager: ConnectionManager):
     await _step_done(
         session, manager, "grouping",
         f"Formed {len(session.groups)} style groups "
-        f"({garment_count} garment images + {spec_count} spec labels assigned)"
+        f"({garment_count} garment images + {spec_count} spec labels)"
     )
 
 
