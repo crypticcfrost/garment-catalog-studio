@@ -1,19 +1,59 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useAppStore } from '../store/useAppStore'
-import type { ImageItem, StyleGroup, PipelineStep } from '../types'
-import { wsSessionUrl } from '../config'
+import type { ImageItem, StyleGroup, PipelineStep, SessionStatus } from '../types'
+import { apiUrl, preferHttpPollingForLiveSession, wsSessionUrl } from '../config'
 
 export function useWebSocket(sessionId: string | null) {
-  const ws             = useRef<WebSocket | null>(null)
+  const ws = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const generation     = useRef(0)   // incremented on every cleanup; stale closures check this
-  const store          = useAppStore()
+  const generation = useRef(0)
+  const pollHintLogged = useRef(false)
+
+  const usePolling = preferHttpPollingForLiveSession()
+
+  // ── HTTP polling (Vercel / no WebSocket) ───────────────────────────────────
+  useEffect(() => {
+    pollHintLogged.current = false
+    if (!sessionId || !usePolling) return
+
+    let cancelled = false
+
+    const tick = async () => {
+      if (cancelled) return
+      try {
+        const res = await fetch(apiUrl(`/api/sessions/${sessionId}/state`))
+        if (!res.ok || cancelled) return
+        const snap = (await res.json()) as PollSnapshot
+        const st = useAppStore.getState()
+        st.applyPollSnapshot({
+          sessionStatus: snap.status as SessionStatus,
+          images: buildImagesFromPoll(snap.images ?? {}),
+          groups: buildGroupsFromPoll(snap.groups ?? {}),
+          pipelineSteps: buildStepsFromPoll(snap.pipeline_steps ?? []),
+          pptUrl: snap.ppt_url ?? null,
+          pptVersion: snap.version ?? 0,
+          mergeEmptyPipeline: true,
+        })
+        if (!pollHintLogged.current) {
+          pollHintLogged.current = true
+          st.addLog('Live updates: polling (WebSockets are not available on this host).', 'info')
+        }
+      } catch {
+        /* ignore transient network errors */
+      }
+    }
+
+    void tick()
+    const id = setInterval(() => void tick(), 900)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [sessionId, usePolling])
 
   const connect = useCallback(() => {
-    if (!sessionId) return
-    // Don't create a duplicate if we're already open to the right session
+    if (!sessionId || usePolling) return
     if (ws.current?.readyState === WebSocket.OPEN) return
-    // Don't connect to a CONNECTING socket either — wait for it
     if (ws.current?.readyState === WebSocket.CONNECTING) return
 
     const myGen = ++generation.current
@@ -21,7 +61,7 @@ export function useWebSocket(sessionId: string | null) {
     ws.current = socket
 
     socket.onopen = () => {
-      store.addLog('Connected to pipeline', 'success')
+      useAppStore.getState().addLog('Connected to pipeline', 'success')
       const hb = setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: 'ping' }))
@@ -34,63 +74,118 @@ export function useWebSocket(sessionId: string | null) {
     socket.onmessage = (e) => {
       try {
         const event = JSON.parse(e.data)
-        handleEvent(event, store)
+        handleEvent(event, useAppStore.getState())
       } catch {
         // ignore malformed frames
       }
     }
 
     socket.onerror = () => {
-      store.addLog('WebSocket error — will retry…', 'warning')
+      useAppStore.getState().addLog('WebSocket error — will retry…', 'warning')
     }
 
     socket.onclose = () => {
-      // Only schedule a reconnect when this connection is still the active one.
-      // If generation changed it means the hook cleaned up intentionally
-      // (session changed / component unmounted) — do NOT reconnect in that case.
       if (generation.current === myGen) {
         reconnectTimer.current = setTimeout(connect, 3000)
       }
     }
-  }, [sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sessionId, usePolling])
 
   useEffect(() => {
-    // Invalidate any previously scheduled reconnect from the old session
+    if (!sessionId || usePolling) return
+
     generation.current++
     if (reconnectTimer.current) {
       clearTimeout(reconnectTimer.current)
       reconnectTimer.current = null
     }
-    // Close any existing socket cleanly before opening a new one
     if (ws.current && ws.current.readyState !== WebSocket.CLOSED) {
-      ws.current.onclose = null   // detach handler so it doesn't fire another reconnect
+      ws.current.onclose = null
       ws.current.close()
     }
 
     connect()
 
     return () => {
-      generation.current++   // invalidate current generation on unmount / session change
+      generation.current++
       if (reconnectTimer.current) {
         clearTimeout(reconnectTimer.current)
         reconnectTimer.current = null
       }
       if (ws.current) {
-        ws.current.onclose = null  // prevent a reconnect attempt after intentional close
+        ws.current.onclose = null
         ws.current.close()
       }
     }
-  }, [connect])
+  }, [connect, sessionId, usePolling])
 }
 
-// ── Event dispatcher ──────────────────────────────────────────────────────────
+// ── Poll snapshot types / mappers ────────────────────────────────────────────
+
+interface PollSnapshot {
+  status: string
+  images?: Record<string, Record<string, unknown>>
+  groups?: Record<string, Record<string, unknown>>
+  pipeline_steps?: unknown[]
+  ppt_url?: string | null
+  version?: number
+}
+
+function buildImagesFromPoll(raw: Record<string, Record<string, unknown>>): Record<string, ImageItem> {
+  const out: Record<string, ImageItem> = {}
+  for (const [id, row] of Object.entries(raw)) {
+    out[id] = {
+      id,
+      filename: row.filename as string,
+      previewUrl: (row.preview_url as string) || '',
+      processedUrl: (row.processed_url as string) || undefined,
+      status: row.status as ImageItem['status'],
+      imageType: (row.image_type as ImageItem['imageType']) || undefined,
+      styleId: row.style_id as string | undefined,
+      confidence: (row.confidence as number) ?? 0,
+      garmentData: row.garment_data as ImageItem['garmentData'],
+      errorMessage: row.error_message as string | undefined,
+      description: row.description as string | undefined,
+      colors: row.colors as string[] | undefined,
+    }
+  }
+  return out
+}
+
+function buildGroupsFromPoll(raw: Record<string, Record<string, unknown>>): Record<string, StyleGroup> {
+  const out: Record<string, StyleGroup> = {}
+  for (const [id, row] of Object.entries(raw)) {
+    out[id] = {
+      id,
+      styleId: row.style_id as string,
+      garmentType: row.garment_type as string | undefined,
+      imageIds: (row.images as string[]) ?? [],
+      garmentData: row.garment_data as StyleGroup['garmentData'],
+      slideNumber: row.slide_number as number | undefined,
+    }
+  }
+  return out
+}
+
+function buildStepsFromPoll(raw: unknown[]): PipelineStep[] {
+  return raw
+    .filter((x): x is Record<string, unknown> => typeof x === 'object' && x != null)
+    .map((s) => ({
+      id: String(s.id),
+      label: String(s.label ?? ''),
+      status: (s.status as PipelineStep['status']) ?? 'pending',
+      progress: Number(s.progress ?? 0),
+      message: s.message as string | undefined,
+    }))
+}
+
+// ── WebSocket event dispatcher ───────────────────────────────────────────────
 
 function handleEvent(event: { type: string; data: Record<string, unknown> }, store: ReturnType<typeof useAppStore.getState>) {
   const { type, data } = event
 
   switch (type) {
     case 'session_state': {
-      // Restore full session after reconnect
       if (data.pipeline_steps) {
         store.setPipelineSteps(data.pipeline_steps as PipelineStep[])
       }
@@ -102,11 +197,11 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
             : ''
           store.addImage({
             id,
-            filename:   img.filename as string,
+            filename: img.filename as string,
             previewUrl: thumb,
-            status:     (img.status as ImageItem['status']) ?? 'uploaded',
-            imageType:  img.image_type as ImageItem['imageType'],
-            styleId:    img.style_id as string | undefined,
+            status: (img.status as ImageItem['status']) ?? 'uploaded',
+            imageType: img.image_type as ImageItem['imageType'],
+            styleId: img.style_id as string | undefined,
             confidence: (img.confidence as number) ?? 0,
           } as ImageItem)
         }
@@ -115,9 +210,9 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
         const rawGroups = data.groups as Record<string, Record<string, unknown>>
         const groups: StyleGroup[] = Object.entries(rawGroups).map(([id, g]) => ({
           id,
-          styleId:     g.style_id as string,
+          styleId: g.style_id as string,
           garmentType: g.garment_type as string | undefined,
-          imageIds:    (g.images as string[]) ?? [],
+          imageIds: (g.images as string[]) ?? [],
           garmentData: g.garment_data as StyleGroup['garmentData'],
           slideNumber: g.slide_number as number | undefined,
         }))
@@ -136,10 +231,10 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
     case 'image_uploaded': {
       const thumb = `/uploads/${store.sessionId}/${(data.thumbnail as string)?.split('/').pop() ?? ''}`
       store.addImage({
-        id:         data.image_id as string,
-        filename:   data.filename as string,
+        id: data.image_id as string,
+        filename: data.filename as string,
         previewUrl: (data.thumbnail as string) || thumb,
-        status:     'uploaded',
+        status: 'uploaded',
         confidence: 0,
       } as ImageItem)
       break
@@ -154,11 +249,11 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
 
     case 'image_classified': {
       store.updateImage(data.image_id as string, {
-        status:      'classified',
-        imageType:   data.image_type as ImageItem['imageType'],
-        styleId:     data.style_id as string | undefined,
-        confidence:  data.confidence as number,
-        colors:      data.colors as string[],
+        status: 'classified',
+        imageType: data.image_type as ImageItem['imageType'],
+        styleId: data.style_id as string | undefined,
+        confidence: data.confidence as number,
+        colors: data.colors as string[],
         description: (data.key_features || data.description) as string,
       })
       const pct = Math.round((data.confidence as number) * 100)
@@ -170,7 +265,6 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
     }
 
     case 'spec_label_reassigned': {
-      // Spec label moved to correct group after OCR extracted reference number
       store.moveImageToGroup(data.image_id as string, data.group_id as string)
       store.addLog(
         `Spec label ${data.image_id} reassigned to ${data.style_id} (ref match)`,
@@ -182,10 +276,10 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
     case 'images_grouped': {
       const rawGroups = (data.groups as Array<Record<string, unknown>>) ?? []
       const groups: StyleGroup[] = rawGroups.map((g) => ({
-        id:          g.group_id as string,
-        styleId:     g.style_id as string,
+        id: g.group_id as string,
+        styleId: g.style_id as string,
         garmentType: g.garment_type as string | undefined,
-        imageIds:    (g.image_ids as string[]) ?? [],
+        imageIds: (g.image_ids as string[]) ?? [],
       }))
       store.setGroups(groups)
       store.addLog(`Formed ${groups.length} style groups`, 'success')
@@ -197,11 +291,11 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
       store.updateImage(data.image_id as string, {
         status: 'extracted',
         garmentData: {
-          reference_number:   d.reference_number as string,
+          reference_number: d.reference_number as string,
           fabric_composition: d.fabric_composition as string,
-          gsm:                d.gsm as string,
-          date:               d.date as string,
-          brand:              d.brand as string,
+          gsm: d.gsm as string,
+          date: d.date as string,
+          brand: d.brand as string,
         },
       })
       store.addLog(`Extracted specs from ${data.image_id}`, 'success')
@@ -210,7 +304,7 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
 
     case 'image_processed': {
       store.updateImage(data.image_id as string, {
-        status:       'processed',
+        status: 'processed',
         processedUrl: data.processed_url as string,
       })
       break
@@ -218,7 +312,7 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
 
     case 'image_error': {
       store.updateImage(data.image_id as string, {
-        status:       'error',
+        status: 'error',
         errorMessage: data.error as string,
       })
       store.addLog(`Error on ${data.image_id}: ${data.error}`, 'error')
@@ -235,9 +329,9 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
 
     case 'step_update': {
       store.updatePipelineStep(data.step_id as string, {
-        status:   data.status as PipelineStep['status'],
+        status: data.status as PipelineStep['status'],
         progress: data.progress as number,
-        message:  data.message as string | undefined,
+        message: data.message as string | undefined,
       })
       if (data.message) store.addLog(data.message as string, data.status === 'complete' ? 'success' : 'info')
       break

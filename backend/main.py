@@ -157,6 +157,65 @@ async def get_status(session_id: str):
     }
 
 
+def _session_poll_snapshot(session_id: str, s: Session) -> dict:
+    """
+    Full session view for HTTP polling (Vercel has no long-lived WebSocket to Python).
+    Shape matches what the SPA needs to replace images / groups / pipeline / export state.
+    """
+    images: dict = {}
+    for iid, img in s.images.items():
+        fname = Path(img.original_path).name
+        gd = img.garment_data
+        images[iid] = {
+            "id": img.id,
+            "filename": img.filename,
+            "status": img.status.value if hasattr(img.status, "value") else str(img.status),
+            "image_type": img.image_type.value if img.image_type else None,
+            "style_id": img.style_id,
+            "confidence": img.confidence,
+            "garment_data": json.loads(gd.model_dump_json()) if gd else None,
+            "error_message": img.error_message,
+            "description": img.description,
+            "colors": img.colors or [],
+            "preview_url": f"/uploads/{session_id}/{fname}",
+            "processed_url": (
+                f"/outputs/{session_id}/processed/{iid}_processed.jpg"
+                if img.processed_path
+                else None
+            ),
+        }
+
+    groups: dict = {}
+    for gid, grp in s.groups.items():
+        gdata = grp.garment_data
+        groups[gid] = {
+            "id": gid,
+            "style_id": grp.style_id,
+            "garment_type": grp.garment_type,
+            "images": list(grp.images),
+            "garment_data": json.loads(gdata.model_dump_json()) if gdata else None,
+            "slide_number": grp.slide_number,
+        }
+
+    ppt_url = f"/api/sessions/{session_id}/download" if s.ppt_path else None
+
+    return {
+        "status": s.status,
+        "images": images,
+        "groups": groups,
+        "pipeline_steps": s.pipeline_steps or [],
+        "ppt_url": ppt_url,
+        "version": s.version,
+    }
+
+
+@app.get("/api/sessions/{session_id}/state")
+async def get_session_state(session_id: str):
+    """Full session snapshot for clients that cannot use WebSockets (e.g. Vercel serverless)."""
+    s = _get_session(session_id)
+    return _session_poll_snapshot(session_id, s)
+
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/sessions/{session_id}/upload")

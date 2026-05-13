@@ -55,6 +55,18 @@ interface AppState {
 
   // Actions — manual reclassify
   moveImageToGroup: (imageId: string, targetGroupId: string) => void
+
+  /** Replace main session view from HTTP poll snapshot (Vercel / no WebSocket). */
+  applyPollSnapshot: (payload: {
+    sessionStatus: SessionStatus
+    images: Record<string, ImageItem>
+    groups: Record<string, StyleGroup>
+    pipelineSteps: PipelineStep[]
+    pptUrl: string | null
+    pptVersion: number
+    /** When true, keep existing pipelineSteps if payload has none (pre-run session). */
+    mergeEmptyPipeline?: boolean
+  }) => void
 }
 
 const INITIAL_STEPS: PipelineStep[] = [
@@ -159,4 +171,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return { groups }
     }),
+
+  applyPollSnapshot: (payload) =>
+    set((state) => ({
+      sessionStatus: payload.sessionStatus,
+      images: payload.images,
+      groups: payload.groups,
+      pipelineSteps:
+        payload.mergeEmptyPipeline && payload.pipelineSteps.length === 0
+          ? state.pipelineSteps
+          : payload.pipelineSteps,
+      pptUrl: payload.pptUrl,
+      pptVersion: payload.pptVersion,
+    })),
 }))

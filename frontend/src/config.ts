@@ -57,3 +57,15 @@ export function wsSessionUrl(sessionId: string): string {
   const basePath = trimTrailingSlash(API_BASE)
   return `${wsProto}//${window.location.host}${basePath}/ws/${sessionId}`
 }
+
+/**
+ * Vercel serverless cannot keep a WebSocket open to the Python backend.
+ * Production builds poll `GET /api/sessions/:id/state` instead.
+ * Set `VITE_USE_POLLING=false` at build time to use WebSockets (self-hosted ASGI).
+ */
+export function preferHttpPollingForLiveSession(): boolean {
+  const v = import.meta.env.VITE_USE_POLLING as string | undefined
+  if (v === 'true') return true
+  if (v === 'false') return false
+  return import.meta.env.PROD
+}
