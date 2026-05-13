@@ -29,8 +29,20 @@ export default function App() {
     const init = async () => {
       try {
         const res = await fetch(apiUrl('/api/sessions'), { method: 'POST' })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const data = await res.json()
+        const text = await res.text()
+        if (!res.ok) {
+          let detail = text.slice(0, 400)
+          try {
+            const j = JSON.parse(text) as { detail?: string | unknown[] }
+            if (typeof j.detail === 'string') detail = j.detail
+            else if (Array.isArray(j.detail))
+              detail = j.detail.map((d) => (typeof d === 'object' && d && 'msg' in d ? String((d as { msg: string }).msg) : JSON.stringify(d))).join('; ')
+          } catch {
+            /* keep raw slice */
+          }
+          throw new Error(`HTTP ${res.status}: ${detail}`)
+        }
+        const data = JSON.parse(text) as { session_id: string }
         setSessionId(data.session_id)
         setSessionReady(true)
         setInitError(null)
@@ -118,11 +130,12 @@ export default function App() {
               </>
             ) : (
               <>
-                <p className="text-sm text-danger">Could not reach the API ({initError}).</p>
+                <p className="text-sm text-danger">
+                  Could not start a session ({initError}).
+                </p>
                 <p className="text-xs text-muted">
-                  On Vercel, the backend should be available under the same deployment. If you use a
-                  separate API host, set <code className="text-faint">VITE_API_BASE_URL</code> at
-                  build time.
+                  Check that you are online and the app finished deploying. If the problem continues,
+                  try again in a moment.
                 </p>
                 <button
                   type="button"

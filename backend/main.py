@@ -1,3 +1,4 @@
+import logging
 import uuid
 import json
 from pathlib import Path
@@ -23,6 +24,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+log = logging.getLogger(__name__)
 
 manager = ConnectionManager()
 sessions: dict[str, Session] = {}
@@ -56,6 +59,11 @@ def _save_session_manifest(session: Session) -> None:
 
 def _restore_sessions() -> None:
     """On startup, rebuild in-memory sessions from any manifests on disk."""
+    try:
+        if not UPLOAD_DIR.is_dir():
+            return
+    except OSError:
+        return
     for session_dir in UPLOAD_DIR.iterdir():
         if not session_dir.is_dir():
             continue
@@ -85,7 +93,10 @@ def _restore_sessions() -> None:
 
 @app.on_event("startup")
 async def _on_startup():
-    _restore_sessions()
+    try:
+        _restore_sessions()
+    except Exception:
+        log.exception("session restore on startup failed (non-fatal)")
 
 ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
 
@@ -97,8 +108,17 @@ async def create_session():
     sid = str(uuid.uuid4())[:8].upper()
     session = Session(id=sid)
     sessions[sid] = session
-    (UPLOAD_DIR / sid).mkdir(parents=True, exist_ok=True)
-    (OUTPUT_DIR / sid).mkdir(parents=True, exist_ok=True)
+    try:
+        (UPLOAD_DIR / sid).mkdir(parents=True, exist_ok=True)
+        (OUTPUT_DIR / sid).mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.exception("create_session: could not mkdir for %s", sid)
+        sessions.pop(sid, None)
+        raise HTTPException(
+            503,
+            detail="Storage is not writable on this host. For Vercel, ensure VERCEL is set and "
+            "TMPDIR is writable, or set GARMENT_STORAGE_ROOT to a writable directory.",
+        ) from e
     return {"session_id": sid}
 
 
