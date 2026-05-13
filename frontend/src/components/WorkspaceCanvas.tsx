@@ -11,6 +11,7 @@ import { Grid3X3, Layers, LayoutGrid } from 'lucide-react'
 import { StyleGroupCluster } from './StyleGroupCluster'
 import { ImageCard } from './ImageCard'
 import { useAppStore } from '../store/useAppStore'
+import { apiUrl } from '../config'
 import { UploadZone } from './UploadZone'
 
 type ViewMode = 'grouped' | 'grid'
@@ -54,7 +55,7 @@ export function WorkspaceCanvas() {
         if (sessionId) {
           try {
             await fetch(
-              `http://localhost:8000/api/sessions/${sessionId}/images/${activeId}/reclassify`,
+              apiUrl(`/api/sessions/${sessionId}/images/${activeId}/reclassify`),
               {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },

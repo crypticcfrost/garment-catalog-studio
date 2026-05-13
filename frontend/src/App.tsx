@@ -10,8 +10,7 @@ import { PipelinePanel } from './components/PipelinePanel'
 import { SlidePreviewBar } from './components/SlidePreviewBar'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useAppStore } from './store/useAppStore'
-
-const API = 'http://localhost:8000'
+import { apiUrl } from './config'
 
 export default function App() {
   const {
@@ -23,18 +22,22 @@ export default function App() {
   } = useAppStore()
 
   const [sessionReady, setSessionReady] = useState(false)
+  const [initError, setInitError] = useState<string | null>(null)
 
   // Create session on mount
   useEffect(() => {
     const init = async () => {
       try {
-        const res = await fetch(`${API}/api/sessions`, { method: 'POST' })
+        const res = await fetch(apiUrl('/api/sessions'), { method: 'POST' })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const data = await res.json()
         setSessionId(data.session_id)
         setSessionReady(true)
+        setInitError(null)
         addLog(`Session created: #${data.session_id}`, 'success')
       } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        setInitError(msg)
         addLog(`Failed to create session: ${e}`, 'error')
       }
     }
@@ -105,11 +108,31 @@ export default function App() {
         <motion.div
           initial={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 z-50 bg-bg flex items-center justify-center"
+          className="fixed inset-0 z-50 bg-bg flex items-center justify-center px-6"
         >
-          <div className="text-center space-y-4">
-            <div className="w-12 h-12 border-2 border-accent/30 border-t-accent rounded-full animate-spin mx-auto" />
-            <p className="text-sm text-muted">Initialising session…</p>
+          <div className="text-center space-y-4 max-w-md">
+            {!initError ? (
+              <>
+                <div className="w-12 h-12 border-2 border-accent/30 border-t-accent rounded-full animate-spin mx-auto" />
+                <p className="text-sm text-muted">Initialising session…</p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-danger">Could not reach the API ({initError}).</p>
+                <p className="text-xs text-muted">
+                  On Vercel, the backend should be available under the same deployment. If you use a
+                  separate API host, set <code className="text-faint">VITE_API_BASE_URL</code> at
+                  build time.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="text-xs font-medium px-4 py-2 rounded-lg border border-white/15 hover:bg-white/5 text-text"
+                >
+                  Retry
+                </button>
+              </>
+            )}
           </div>
         </motion.div>
       )}

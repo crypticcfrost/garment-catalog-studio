@@ -2,6 +2,7 @@ import { Download, Layers, Zap, ChevronRight } from 'lucide-react'
 import { motion } from 'framer-motion'
 import { useAppStore } from '../store/useAppStore'
 import { clsx } from 'clsx'
+import { apiUrl } from '../config'
 
 export function Header() {
   const { sessionId, sessionStatus, pptUrl, images, groups } = useAppStore()
@@ -56,7 +57,7 @@ export function Header() {
 
         {pptUrl && (
           <motion.a
-            href={pptUrl}
+            href={apiUrl(pptUrl)}
             download
             initial={{ opacity: 0, scale: 0.9 }}
             animate={{ opacity: 1, scale: 1 }}

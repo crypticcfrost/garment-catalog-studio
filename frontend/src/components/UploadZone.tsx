@@ -4,8 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { Upload, ImagePlus, X, Play, Loader2 } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useAppStore } from '../store/useAppStore'
-
-const API = 'http://localhost:8000'
+import { apiUrl } from '../config'
 
 interface Props {
   onProcessStart: () => void
@@ -33,7 +32,7 @@ export function UploadZone({ onProcessStart }: Props) {
         const form = new FormData()
         batch.forEach((f) => form.append('files', f))
         try {
-          const res = await fetch(`${API}/api/sessions/${sessionId}/upload`, {
+          const res = await fetch(apiUrl(`/api/sessions/${sessionId}/upload`), {
             method: 'POST',
             body: form,
           })
@@ -60,7 +59,7 @@ export function UploadZone({ onProcessStart }: Props) {
   const handleProcess = async () => {
     if (!sessionId) return
     try {
-      const res = await fetch(`${API}/api/sessions/${sessionId}/process`, { method: 'POST' })
+      const res = await fetch(apiUrl(`/api/sessions/${sessionId}/process`), { method: 'POST' })
       if (!res.ok) throw new Error(`Process failed: ${res.status}`)
       setSessionStatus('processing')
       onProcessStart()

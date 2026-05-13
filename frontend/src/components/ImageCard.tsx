@@ -5,6 +5,7 @@ import { clsx } from 'clsx'
 import { StatusBadge } from './StatusBadge'
 import { useAppStore } from '../store/useAppStore'
 import type { ImageItem } from '../types'
+import { apiUrl, mediaUrl } from '../config'
 
 const TYPE_LABELS: Record<string, string> = {
   front:      'F',
@@ -33,14 +34,15 @@ interface Props {
 export function ImageCard({ image, compact = false, selected = false, onSelect, draggable }: Props) {
   const { sessionId, addLog } = useAppStore()
   const [retrying, setRetrying] = useState(false)
-  const imgSrc = image.processedUrl || image.previewUrl
+  const raw = image.processedUrl || image.previewUrl
+  const imgSrc = mediaUrl(raw)
 
   const handleRetry = async (e: React.MouseEvent) => {
     e.stopPropagation()
     if (!sessionId) return
     setRetrying(true)
     try {
-      await fetch(`http://localhost:8000/api/sessions/${sessionId}/images/${image.id}/retry`, {
+      await fetch(apiUrl(`/api/sessions/${sessionId}/images/${image.id}/retry`), {
         method: 'POST',
       })
       addLog(`Retrying classification for ${image.id}`, 'info')

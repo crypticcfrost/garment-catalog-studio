@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useAppStore } from '../store/useAppStore'
+import { mediaUrl } from '../config'
 import { StatusBadge } from './StatusBadge'
 import type { PipelineStep, ImageItem } from '../types'
 
@@ -253,7 +254,7 @@ function PipelineStepRow({ step, index }: { step: PipelineStep; index: number })
 }
 
 function ImageRow({ image }: { image: ImageItem }) {
-  const imgSrc = image.processedUrl || image.previewUrl
+  const imgSrc = mediaUrl(image.processedUrl || image.previewUrl)
 
   return (
     <div className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-white/[0.03] transition-colors">

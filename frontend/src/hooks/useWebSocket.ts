@@ -1,10 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import type { ImageItem, StyleGroup, PipelineStep } from '../types'
-
-const WS_BASE = import.meta.env.DEV
-  ? 'ws://localhost:8000/ws'
-  : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
+import { wsSessionUrl } from '../config'
 
 export function useWebSocket(sessionId: string | null) {
   const ws             = useRef<WebSocket | null>(null)
@@ -20,7 +17,7 @@ export function useWebSocket(sessionId: string | null) {
     if (ws.current?.readyState === WebSocket.CONNECTING) return
 
     const myGen = ++generation.current
-    const socket = new WebSocket(`${WS_BASE}/${sessionId}`)
+    const socket = new WebSocket(wsSessionUrl(sessionId))
     ws.current = socket
 
     socket.onopen = () => {
@@ -141,7 +138,7 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
       store.addImage({
         id:         data.image_id as string,
         filename:   data.filename as string,
-        previewUrl: data.thumbnail as string ?? thumb,
+        previewUrl: (data.thumbnail as string) || thumb,
         status:     'uploaded',
         confidence: 0,
       } as ImageItem)

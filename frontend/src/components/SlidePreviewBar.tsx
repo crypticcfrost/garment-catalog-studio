@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { ChevronUp, ChevronDown, Download, Presentation, Eye } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useAppStore } from '../store/useAppStore'
+import { apiUrl, mediaUrl } from '../config'
 
 export function SlidePreviewBar() {
   const { groups, images, pptUrl, pptVersion, sessionStatus } = useAppStore()
@@ -38,7 +39,7 @@ export function SlidePreviewBar() {
         )}
 
         <a
-          href={pptUrl ?? '#'}
+          href={pptUrl ? apiUrl(pptUrl) : '#'}
           download
           onClick={(e) => !pptUrl && e.preventDefault()}
           className={clsx(
@@ -79,7 +80,8 @@ export function SlidePreviewBar() {
                   return img?.imageType === 'front'
                 })
                 const frontImg = frontId ? images[frontId] : null
-                const thumb = frontImg?.processedUrl || frontImg?.previewUrl
+                const thumbRaw = frontImg?.processedUrl || frontImg?.previewUrl
+                const thumb = mediaUrl(thumbRaw)
 
                 return (
                   <SlideCard
