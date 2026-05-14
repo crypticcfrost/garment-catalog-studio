@@ -1,8 +1,9 @@
 import logging
+import os
 import uuid
 import json
 from pathlib import Path
-from typing import List
+from typing import Callable, List
 
 import aiofiles
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
@@ -14,6 +15,31 @@ from models import Session, ImageItem, ImageStatus
 from ws_manager import ConnectionManager
 from pipeline import run_pipeline
 from config import UPLOAD_DIR, OUTPUT_DIR, MAX_IMAGE_SIZE_MB
+
+
+class StripBackendPrefixMiddleware:
+    """
+    Vercel experimentalServices mounts this app under routePrefix (e.g. /_/backend).
+    Incoming ASGI paths are often the full URL path, so strip the prefix before routing.
+    """
+
+    def __init__(self, app: Callable, prefix: str):
+        self.app = app
+        self.prefix = (prefix or "").rstrip("/")
+
+    async def __call__(self, scope, receive, send):
+        if self.prefix and scope["type"] in ("http", "websocket"):
+            path = scope.get("path") or ""
+            new_path = None
+            if path.startswith(self.prefix + "/"):
+                new_path = path[len(self.prefix) :] or "/"
+            elif path == self.prefix:
+                new_path = "/"
+            if new_path is not None:
+                scope = dict(scope)
+                scope["path"] = new_path
+        await self.app(scope, receive, send)
+
 
 app = FastAPI(title="Garment Catalog Studio", version="1.0.0")
 
@@ -119,6 +145,7 @@ async def create_session():
             detail="Storage is not writable on this host. For Vercel, ensure VERCEL is set and "
             "TMPDIR is writable, or set GARMENT_STORAGE_ROOT to a writable directory.",
         ) from e
+    _save_session_manifest(session)
     return {"session_id": sid}
 
 
@@ -411,10 +438,45 @@ app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
 def _get_session(session_id: str) -> Session:
     if session_id not in sessions:
+        _hydrate_session_from_manifest(session_id)
+    if session_id not in sessions:
         raise HTTPException(404, f"Session '{session_id}' not found")
     return sessions[session_id]
+
+
+def _hydrate_session_from_manifest(session_id: str) -> None:
+    """Re-load a session from disk when it is missing from memory (warm container / recovery)."""
+    if session_id in sessions:
+        return
+    manifest = _manifest_path(session_id)
+    if not manifest.exists():
+        return
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        if data.get("id") != session_id:
+            return
+        session = Session(id=session_id)
+        session.status = data.get("status", "idle")
+        for img_id, img_data in data.get("images", {}).items():
+            path = img_data.get("original_path", "")
+            if path and Path(path).exists():
+                session.images[img_id] = ImageItem(
+                    id=img_data["id"],
+                    filename=img_data["filename"],
+                    original_path=path,
+                )
+        sessions[session_id] = session
+    except Exception:
+        log.exception("hydrate session %s from manifest failed", session_id)
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+# When deployed behind Vercel's backend routePrefix, strip it so routes match /api/...
+if os.getenv("VERCEL"):
+    _prefix = os.getenv("VERCEL_BACKEND_PREFIX", "/_/backend").strip()
+    if _prefix:
+        app = StripBackendPrefixMiddleware(app, _prefix)
