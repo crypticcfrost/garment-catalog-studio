@@ -8,12 +8,14 @@ export function useWebSocket(sessionId: string | null) {
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const generation = useRef(0)
   const pollHintLogged = useRef(false)
+  const sessionLostLogged = useRef(false)
 
   const usePolling = preferHttpPollingForLiveSession()
 
   // ── HTTP polling (Vercel / no WebSocket) ───────────────────────────────────
   useEffect(() => {
     pollHintLogged.current = false
+    sessionLostLogged.current = false
     if (!sessionId || !usePolling) return
 
     let cancelled = false
@@ -22,8 +24,19 @@ export function useWebSocket(sessionId: string | null) {
       if (cancelled) return
       try {
         const res = await fetch(apiUrl(`/api/sessions/${sessionId}/state`))
-        if (!res.ok || cancelled) return
+        if (cancelled) return
+        if (!res.ok) return
         const snap = (await res.json()) as PollSnapshot
+        if (snap.session_lost) {
+          if (!sessionLostLogged.current) {
+            sessionLostLogged.current = true
+            useAppStore.getState().addLog(
+              'This page lost contact with the session on the server (common on serverless). Refresh the page to start a new session.',
+              'warning'
+            )
+          }
+          return
+        }
         const st = useAppStore.getState()
         st.applyPollSnapshot({
           sessionStatus: snap.status as SessionStatus,
@@ -124,6 +137,7 @@ export function useWebSocket(sessionId: string | null) {
 
 interface PollSnapshot {
   status: string
+  session_lost?: boolean
   images?: Record<string, Record<string, unknown>>
   groups?: Record<string, Record<string, unknown>>
   pipeline_steps?: unknown[]

@@ -4,6 +4,10 @@
  * - Local dev: empty string → same-origin paths like `/api/...` hit the Vite proxy.
  * - Vercel (experimentalServices): backend is mounted at `/_/backend` per vercel.json.
  * - Override anytime: set `VITE_API_BASE_URL` (e.g. https://api.example.com or /_/backend).
+ *
+ * Backend path stripping: Python strips `VERCEL_BACKEND_PREFIX` (default `/_/backend`) from
+ * every request path when it matches, so routes stay `/api/...` without relying on `VERCEL=1`.
+ * Set `VERCEL_BACKEND_PREFIX=` (empty) on self-hosted APIs that are not mounted under a prefix.
  */
 
 function trimTrailingSlash(s: string): string {

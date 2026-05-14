@@ -240,8 +240,24 @@ def _session_poll_snapshot(session_id: str, s: Session) -> dict:
 
 @app.get("/api/sessions/{session_id}/state")
 async def get_session_state(session_id: str):
-    """Full session snapshot for clients that cannot use WebSockets (e.g. Vercel serverless)."""
-    s = _get_session(session_id)
+    """
+    Full session snapshot for HTTP polling.
+    Never returns 404 for a missing in-memory session: serverless may hit a different
+    instance than the one that created the session (reply with session_lost instead).
+    """
+    if session_id not in sessions:
+        _hydrate_session_from_manifest(session_id)
+    if session_id not in sessions:
+        return {
+            "status": "idle",
+            "session_lost": True,
+            "images": {},
+            "groups": {},
+            "pipeline_steps": [],
+            "ppt_url": None,
+            "version": 0,
+        }
+    s = sessions[session_id]
     return _session_poll_snapshot(session_id, s)
 
 
@@ -514,8 +530,8 @@ if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
 
-# When deployed behind Vercel's backend routePrefix, strip it so routes match /api/...
-if os.getenv("VERCEL"):
-    _prefix = os.getenv("VERCEL_BACKEND_PREFIX", "/_/backend").strip()
-    if _prefix:
-        app = StripBackendPrefixMiddleware(app, _prefix)
+# Strip /_/backend (or VERCEL_BACKEND_PREFIX) from incoming paths so routes match /api/...
+# Do not gate on VERCEL — that env is not guaranteed on all Python runtimes.
+_prefix = os.getenv("VERCEL_BACKEND_PREFIX", "/_/backend").strip()
+if _prefix:
+    app = StripBackendPrefixMiddleware(app, _prefix)
