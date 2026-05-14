@@ -272,8 +272,8 @@ def _public_processed_url(session_id: str, image_id: str) -> str:
 
 @app.get("/api/sessions/{session_id}/file/upload/{filename}")
 async def serve_session_upload(session_id: str, filename: str):
-    """Serve original upload bytes (path stays under /api/… for full-stack hosts)."""
-    s = _get_session(session_id)
+    """Serve original upload bytes (no in-memory session required; path must exist on this host)."""
+    _assert_valid_session_dir_name(session_id)
     raw = unquote(filename)
     if "/" in raw or "\\" in raw or raw.startswith(".."):
         raise HTTPException(400, "Invalid filename")
@@ -287,8 +287,8 @@ async def serve_session_upload(session_id: str, filename: str):
 
 @app.get("/api/sessions/{session_id}/file/processed/{image_id}")
 async def serve_session_processed(session_id: str, image_id: str):
-    """Serve processed JPEG for an image id."""
-    s = _get_session(session_id)
+    """Serve processed JPEG for an image id (no in-memory session required)."""
+    _assert_valid_session_dir_name(session_id)
     if not re.match(r"^[0-9a-fA-F]{8}$", image_id):
         raise HTTPException(400, "Invalid image id")
     path = (OUTPUT_DIR / session_id / "processed" / f"{image_id}_processed.jpg").resolve()
@@ -302,7 +302,7 @@ async def serve_session_processed(session_id: str, image_id: str):
 
 @app.post("/api/sessions/{session_id}/upload")
 async def upload_images(session_id: str, files: List[UploadFile] = File(...)):
-    s = _get_session(session_id)
+    s = _require_session(session_id)
     uploaded = []
 
     for file in files:
@@ -344,7 +344,7 @@ async def upload_images(session_id: str, files: List[UploadFile] = File(...)):
 
 @app.post("/api/sessions/{session_id}/process")
 async def start_processing(session_id: str, background_tasks: BackgroundTasks):
-    s = _get_session(session_id)
+    s = _require_session(session_id)
     if not s.images:
         raise HTTPException(400, "No images uploaded")
     if s.status == "processing":
@@ -358,7 +358,7 @@ async def start_processing(session_id: str, background_tasks: BackgroundTasks):
 
 @app.patch("/api/sessions/{session_id}/images/{image_id}/reclassify")
 async def reclassify_image(session_id: str, image_id: str, body: dict):
-    s = _get_session(session_id)
+    s = _require_session(session_id)
     img = s.images.get(image_id)
     if not img:
         raise HTTPException(404, "Image not found")
@@ -392,7 +392,7 @@ async def reclassify_image(session_id: str, image_id: str, body: dict):
 
 @app.post("/api/sessions/{session_id}/images/{image_id}/retry")
 async def retry_image(session_id: str, image_id: str, background_tasks: BackgroundTasks):
-    s = _get_session(session_id)
+    s = _require_session(session_id)
     img = s.images.get(image_id)
     if not img:
         raise HTTPException(404, "Image not found")
@@ -428,7 +428,7 @@ async def retry_image(session_id: str, image_id: str, background_tasks: Backgrou
 
 @app.get("/api/sessions/{session_id}/download")
 async def download_ppt(session_id: str):
-    s = _get_session(session_id)
+    s = _require_session(session_id)
     if not s.ppt_path or not Path(s.ppt_path).exists():
         raise HTTPException(400, "PPT not yet generated")
     return FileResponse(
@@ -440,7 +440,7 @@ async def download_ppt(session_id: str):
 
 @app.get("/api/sessions/{session_id}/slides")
 async def get_slide_list(session_id: str):
-    s = _get_session(session_id)
+    s = _require_session(session_id)
     groups_data = []
     for g in s.groups.values():
         groups_data.append({
@@ -491,6 +491,30 @@ app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+_SESSION_ID_DIR_RE = re.compile(r"^[0-9a-fA-F]{8}$", re.I)
+
+
+def _assert_valid_session_dir_name(session_id: str) -> None:
+    """Session ids are 8-char hex folder names under uploads/outputs."""
+    if not _SESSION_ID_DIR_RE.match(session_id):
+        raise HTTPException(400, "Invalid session id")
+
+
+def _require_session(session_id: str) -> Session:
+    """
+    Load session for a mutating request. Uses 503 (not 404) when the session is missing
+    after hydrate — on serverless, another instance may hold the in-memory session.
+    """
+    if session_id not in sessions:
+        _hydrate_session_from_manifest(session_id)
+    if session_id not in sessions:
+        raise HTTPException(
+            503,
+            detail="Session not available on this server instance. Retry shortly or refresh the page.",
+        )
+    return sessions[session_id]
+
+
 def _get_session(session_id: str) -> Session:
     if session_id not in sessions:
         _hydrate_session_from_manifest(session_id)
@@ -508,7 +532,7 @@ def _hydrate_session_from_manifest(session_id: str) -> None:
         return
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
-        if data.get("id") != session_id:
+        if str(data.get("id", "")).upper() != str(session_id).upper():
             return
         session = Session(id=session_id)
         session.status = data.get("status", "idle")

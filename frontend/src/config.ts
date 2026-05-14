@@ -91,3 +91,21 @@ export function preferHttpPollingForLiveSession(): boolean {
   if (v === 'false') return false
   return import.meta.env.PROD
 }
+
+/** Retry fetch on HTTP 503 (serverless may route to an instance without the session yet). */
+export async function fetchWith503Retries(
+  url: string,
+  init: RequestInit,
+  maxAttempts = 5,
+): Promise<Response> {
+  const backoffMs = [0, 400, 800, 1400, 2200]
+  let last!: Response
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, backoffMs[attempt] ?? 2000))
+    }
+    last = await fetch(url, init)
+    if (last.ok || last.status !== 503) return last
+  }
+  return last
+}
