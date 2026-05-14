@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useAppStore } from '../store/useAppStore'
 import type { ImageItem, StyleGroup, PipelineStep, SessionStatus } from '../types'
-import { apiUrl, preferHttpPollingForLiveSession, wsSessionUrl } from '../config'
+import { apiUrl, preferHttpPollingForLiveSession, sessionMediaUrl, wsSessionUrl } from '../config'
 
 export function useWebSocket(sessionId: string | null) {
   const ws = useRef<WebSocket | null>(null)
@@ -40,7 +40,7 @@ export function useWebSocket(sessionId: string | null) {
         const st = useAppStore.getState()
         st.applyPollSnapshot({
           sessionStatus: snap.status as SessionStatus,
-          images: buildImagesFromPoll(snap.images ?? {}),
+          images: buildImagesFromPoll(sessionId, snap.images ?? {}),
           groups: buildGroupsFromPoll(snap.groups ?? {}),
           pipelineSteps: buildStepsFromPoll(snap.pipeline_steps ?? []),
           pptUrl: snap.ppt_url ?? null,
@@ -145,14 +145,19 @@ interface PollSnapshot {
   version?: number
 }
 
-function buildImagesFromPoll(raw: Record<string, Record<string, unknown>>): Record<string, ImageItem> {
+function buildImagesFromPoll(
+  sessionId: string,
+  raw: Record<string, Record<string, unknown>>,
+): Record<string, ImageItem> {
   const out: Record<string, ImageItem> = {}
   for (const [id, row] of Object.entries(raw)) {
+    const previewRaw = (row.preview_url as string) || ''
+    const processedRaw = (row.processed_url as string) || undefined
     out[id] = {
       id,
       filename: row.filename as string,
-      previewUrl: (row.preview_url as string) || '',
-      processedUrl: (row.processed_url as string) || undefined,
+      previewUrl: sessionMediaUrl(sessionId, previewRaw) ?? '',
+      processedUrl: sessionMediaUrl(sessionId, processedRaw),
       status: row.status as ImageItem['status'],
       imageType: (row.image_type as ImageItem['imageType']) || undefined,
       styleId: row.style_id as string | undefined,
@@ -206,8 +211,14 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
       if (data.images) {
         const imgs = data.images as Record<string, Record<string, unknown>>
         for (const [id, img] of Object.entries(imgs)) {
-          const fname = (img.original_path as string).split(/[/\\]/).pop() ?? ''
-          const thumb = `/api/sessions/${store.sessionId}/file/upload/${encodeURIComponent(fname)}`
+          const opub = img.original_public_url as string | undefined
+          const op = (img.original_path as string) || ''
+          const fname = op.split(/[/\\]/).pop() ?? ''
+          const fallback = `/api/sessions/${store.sessionId}/file/upload/${encodeURIComponent(fname)}`
+          const thumb =
+            sessionMediaUrl(store.sessionId, opub) ||
+            sessionMediaUrl(store.sessionId, fallback) ||
+            fallback
           store.addImage({
             id,
             filename: img.filename as string,
@@ -242,15 +253,12 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
     }
 
     case 'image_uploaded': {
-      const pop = (data.thumbnail as string)?.split('/').pop() ?? ''
-      const fallback =
-        pop && !String(data.thumbnail || '').startsWith('/api/')
-          ? `/api/sessions/${store.sessionId}/file/upload/${encodeURIComponent(pop)}`
-          : ''
+      const thumbRaw = (data.thumbnail as string) || ''
+      const previewUrl = sessionMediaUrl(store.sessionId, thumbRaw) ?? ''
       store.addImage({
         id: data.image_id as string,
         filename: data.filename as string,
-        previewUrl: (data.thumbnail as string) || fallback,
+        previewUrl,
         status: 'uploaded',
         confidence: 0,
       } as ImageItem)
@@ -322,7 +330,7 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
     case 'image_processed': {
       store.updateImage(data.image_id as string, {
         status: 'processed',
-        processedUrl: data.processed_url as string,
+        processedUrl: sessionMediaUrl(store.sessionId, data.processed_url as string | undefined),
       })
       break
     }

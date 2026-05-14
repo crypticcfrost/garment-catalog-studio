@@ -41,7 +41,10 @@ class ImageItem(BaseModel):
     id: str
     filename: str
     original_path: str
+    # When set (e.g. Vercel Blob), browsers and other instances load bytes from this URL.
+    original_public_url: Optional[str] = None
     processed_path: Optional[str] = None
+    processed_public_url: Optional[str] = None
     status: ImageStatus = ImageStatus.UPLOADED
     image_type: Optional[ImageType] = None
     style_id: Optional[str] = None
@@ -86,6 +89,7 @@ class Session(BaseModel):
     groups: Dict[str, Any] = Field(default_factory=dict)
     pipeline_steps: List[Any] = Field(default_factory=list)
     ppt_path: Optional[str] = None
+    ppt_public_url: Optional[str] = None
     version: int = 1
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
     error: Optional[str] = None

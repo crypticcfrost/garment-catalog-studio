@@ -1,7 +1,12 @@
 import asyncio
+import logging
 import uuid
 import shutil
 from pathlib import Path
+
+import persistence
+import session_assets
+from remote_store import blob_enabled, blob_put
 
 from models import (
     Session, ImageItem, ImageStatus, ImageType,
@@ -16,6 +21,8 @@ from .processor import process_image
 from .ppt_generator import generate_catalog_ppt
 
 
+log = logging.getLogger(__name__)
+
 PIPELINE_STEPS = [
     ("grouping",       "Style Grouping"),
     ("extraction",     "Spec Extraction"),
@@ -28,6 +35,7 @@ PIPELINE_STEPS = [
 async def run_pipeline(session: Session, manager: ConnectionManager):
     """Orchestrate the full catalog pipeline with real-time WS events."""
     try:
+        await session_assets.ensure_session_images_local(session)
         session.pipeline_steps = [
             {"id": sid, "label": label, "status": "pending", "progress": 0}
             for sid, label in PIPELINE_STEPS
@@ -44,14 +52,20 @@ async def run_pipeline(session: Session, manager: ConnectionManager):
         await _step_export(session, manager)
 
         session.status = "complete"
+        ppt_link = getattr(session, "ppt_public_url", None) or f"/api/sessions/{session.id}/download"
         await _emit(manager, session.id, "pipeline_complete", {
-            "ppt_url": f"/api/sessions/{session.id}/download",
+            "ppt_url": ppt_link,
             "slides": len(session.groups) + 2,
         })
     except Exception as exc:
         session.status = "error"
         session.error = str(exc)
         await _emit(manager, session.id, "pipeline_error", {"error": str(exc)})
+    finally:
+        try:
+            await asyncio.to_thread(persistence.save_session, session)
+        except Exception:
+            log.exception("persist session after pipeline")
 
 
 # ── Step 1: Grouping (classification-free) ───────────────────────────────────
@@ -234,11 +248,22 @@ async def _step_process(session: Session, manager: ConnectionManager):
             )
             img.processed_path = res.get("output_path") or img.original_path
             img.status = ImageStatus.PROCESSED
+            proc_href = getattr(img, "processed_public_url", None)
+            if blob_enabled() and Path(out_file).is_file():
+                try:
+                    raw = Path(out_file).read_bytes()
+                    pathname = f"garment-catalog/{session.id}/processed/{img_id}.jpg"
+                    meta = await asyncio.to_thread(blob_put, pathname, raw, "image/jpeg")
+                    img.processed_public_url = meta.get("url")
+                    proc_href = img.processed_public_url
+                except Exception:
+                    log.exception("blob upload processed image failed %s", img_id)
             await _emit(manager, session.id, "image_processed", {
                 "image_id":    img_id,
-                "processed_url": f"/api/sessions/{session.id}/file/processed/{img_id}",
+                "processed_url": proc_href or f"/api/sessions/{session.id}/file/processed/{img_id}",
                 "status":      "processed",
             })
+            await asyncio.to_thread(persistence.save_session, session)
         except Exception as e:
             img.processed_path = img.original_path
             img.status = ImageStatus.ERROR
@@ -288,10 +313,24 @@ async def _step_ppt(session: Session, manager: ConnectionManager):
         None, generate_catalog_ppt, ppt_groups, ppt_path, "GARMENT COLLECTION"
     )
     session.ppt_path = ppt_path
+    if blob_enabled() and Path(ppt_path).is_file():
+        try:
+            raw = Path(ppt_path).read_bytes()
+            pathname = f"garment-catalog/{session.id}/catalog_{session.id}.pptx"
+            meta = await asyncio.to_thread(
+                blob_put,
+                pathname,
+                raw,
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
+            session.ppt_public_url = meta.get("url")
+        except Exception:
+            log.exception("blob upload ppt failed")
     session.version += 1
 
+    ppt_href = getattr(session, "ppt_public_url", None) or f"/api/sessions/{session.id}/download"
     await _emit(manager, session.id, "ppt_generated", {
-        "ppt_url":   f"/api/sessions/{session.id}/download",
+        "ppt_url":   ppt_href,
         "slides":    len(ppt_groups) + 2,
         "version":   session.version,
     })

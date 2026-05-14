@@ -62,6 +62,26 @@ export function mediaUrl(path: string | undefined | null): string | undefined {
   return apiUrl(upgraded)
 }
 
+/**
+ * Resolve image URLs for the current session. Prevents bare filenames (e.g. `abc123.png`)
+ * from becoming relative document URLs, which 404 on Vercel.
+ */
+export function sessionMediaUrl(
+  sessionId: string | null | undefined,
+  path: string | undefined | null,
+): string | undefined {
+  if (path == null || path === '') return undefined
+  const p = path.trim()
+  if (p.startsWith('blob:') || p.startsWith('http://') || p.startsWith('https://')) {
+    return p
+  }
+  const sid = sessionId?.trim()
+  if (sid && !/[\\/]/.test(p)) {
+    return apiUrl(`/api/sessions/${sid}/file/upload/${encodeURIComponent(p)}`)
+  }
+  return mediaUrl(p.startsWith('/') ? p : `/${p}`)
+}
+
 /** WebSocket URL for pipeline events (`/ws/{sessionId}` on the backend). */
 export function wsSessionUrl(sessionId: string): string {
   if (import.meta.env.DEV && API_BASE === '') {

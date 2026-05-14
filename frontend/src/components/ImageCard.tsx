@@ -5,7 +5,7 @@ import { clsx } from 'clsx'
 import { StatusBadge } from './StatusBadge'
 import { useAppStore } from '../store/useAppStore'
 import type { ImageItem } from '../types'
-import { apiUrl, mediaUrl } from '../config'
+import { apiUrl, sessionMediaUrl } from '../config'
 
 const TYPE_LABELS: Record<string, string> = {
   front:      'F',
@@ -35,7 +35,7 @@ export function ImageCard({ image, compact = false, selected = false, onSelect, 
   const { sessionId, addLog } = useAppStore()
   const [retrying, setRetrying] = useState(false)
   const raw = image.processedUrl || image.previewUrl
-  const imgSrc = mediaUrl(raw)
+  const imgSrc = sessionMediaUrl(sessionId, raw)
 
   const handleRetry = async (e: React.MouseEvent) => {
     e.stopPropagation()

@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import mimetypes
 import os
 import re
 import uuid
@@ -11,12 +13,14 @@ import aiofiles
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
+import persistence
 from models import Session, ImageItem, ImageStatus
 from ws_manager import ConnectionManager
 from pipeline import run_pipeline
 from config import UPLOAD_DIR, OUTPUT_DIR, MAX_IMAGE_SIZE_MB
+from remote_store import blob_enabled, blob_put, redis_enabled
 
 
 class StripBackendPrefixMiddleware:
@@ -59,30 +63,12 @@ manager = ConnectionManager()
 sessions: dict[str, Session] = {}
 
 
-# ── Session persistence helpers ───────────────────────────────────────────────
+def _canon_session_id(session_id: str) -> str:
+    """Session ids are always stored uppercase to match create_session and disk folders."""
+    return session_id.strip().upper()
 
-def _manifest_path(session_id: str) -> Path:
-    return UPLOAD_DIR / session_id / "_session.json"
 
-
-def _save_session_manifest(session: Session) -> None:
-    """Write a lightweight manifest so sessions survive hot-reloads / restarts."""
-    try:
-        data = {
-            "id": session.id,
-            "status": session.status if session.status != "processing" else "idle",
-            "images": {
-                img_id: {
-                    "id": img.id,
-                    "filename": img.filename,
-                    "original_path": img.original_path,
-                }
-                for img_id, img in session.images.items()
-            },
-        }
-        _manifest_path(session.id).write_text(json.dumps(data), encoding="utf-8")
-    except Exception:
-        pass  # non-fatal
+# ── Session persistence ───────────────────────────────────────────────────────
 
 
 def _restore_sessions() -> None:
@@ -95,32 +81,28 @@ def _restore_sessions() -> None:
     for session_dir in UPLOAD_DIR.iterdir():
         if not session_dir.is_dir():
             continue
-        manifest = session_dir / "_session.json"
-        if not manifest.exists():
+        sid = _canon_session_id(session_dir.name)
+        if sid in sessions:
             continue
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-            sid = data["id"]
-            if sid in sessions:
-                continue  # already loaded
-            session = Session(id=sid)
-            session.status = data.get("status", "idle")
-            for img_id, img_data in data.get("images", {}).items():
-                path = img_data.get("original_path", "")
-                if path and Path(path).exists():
-                    session.images[img_id] = ImageItem(
-                        id=img_data["id"],
-                        filename=img_data["filename"],
-                        original_path=path,
-                    )
-            if session.images:          # only restore if images are still on disk
-                sessions[sid] = session
-        except Exception:
-            pass
+        s = persistence.load_session_from_disk_manifest(sid)
+        if s:
+            sessions[sid] = s
 
 
 @app.on_event("startup")
 async def _on_startup():
+    if os.getenv("VERCEL") or os.getenv("VERCEL_ENV"):
+        if not redis_enabled():
+            log.warning(
+                "Vercel runtime without Redis REST (UPSTASH_REDIS_REST_URL + "
+                "UPSTASH_REDIS_REST_TOKEN or KV_REST_*): sessions may not survive "
+                "routing to a different serverless instance.",
+            )
+        if not blob_enabled():
+            log.warning(
+                "Vercel runtime without BLOB_READ_WRITE_TOKEN: uploaded image bytes "
+                "live only on the instance that received the upload unless files are on shared disk.",
+            )
     try:
         _restore_sessions()
     except Exception:
@@ -147,7 +129,7 @@ async def create_session():
             detail="Storage is not writable on this host. For Vercel, ensure VERCEL is set and "
             "TMPDIR is writable, or set GARMENT_STORAGE_ROOT to a writable directory.",
         ) from e
-    _save_session_manifest(session)
+    persistence.save_session(session)
     return {"session_id": sid}
 
 
@@ -181,7 +163,7 @@ async def get_status(session_id: str):
         "images": len(s.images),
         "groups": len(s.groups),
         "pipeline_steps": s.pipeline_steps,
-        "ppt_ready": s.ppt_path is not None,
+        "ppt_ready": s.ppt_path is not None or bool(getattr(s, "ppt_public_url", None)),
         "version": s.version,
     }
 
@@ -195,6 +177,14 @@ def _session_poll_snapshot(session_id: str, s: Session) -> dict:
     for iid, img in s.images.items():
         fname = Path(img.original_path).name
         gd = img.garment_data
+        pub_orig = getattr(img, "original_public_url", None)
+        preview = pub_orig or _public_upload_url(session_id, fname)
+        pub_proc = getattr(img, "processed_public_url", None)
+        proc_url = None
+        if pub_proc:
+            proc_url = pub_proc
+        elif img.processed_path:
+            proc_url = _public_processed_url(session_id, iid)
         images[iid] = {
             "id": img.id,
             "filename": img.filename,
@@ -206,12 +196,8 @@ def _session_poll_snapshot(session_id: str, s: Session) -> dict:
             "error_message": img.error_message,
             "description": img.description,
             "colors": img.colors or [],
-            "preview_url": _public_upload_url(session_id, fname),
-            "processed_url": (
-                _public_processed_url(session_id, iid)
-                if img.processed_path
-                else None
-            ),
+            "preview_url": preview,
+            "processed_url": proc_url,
         }
 
     groups: dict = {}
@@ -226,7 +212,13 @@ def _session_poll_snapshot(session_id: str, s: Session) -> dict:
             "slide_number": grp.slide_number,
         }
 
-    ppt_url = f"/api/sessions/{session_id}/download" if s.ppt_path else None
+    ppt_pub = getattr(s, "ppt_public_url", None)
+    if ppt_pub:
+        ppt_url = ppt_pub
+    elif s.ppt_path:
+        ppt_url = f"/api/sessions/{session_id}/download"
+    else:
+        ppt_url = None
 
     return {
         "status": s.status,
@@ -245,9 +237,10 @@ async def get_session_state(session_id: str):
     Never returns 404 for a missing in-memory session: serverless may hit a different
     instance than the one that created the session (reply with session_lost instead).
     """
-    if session_id not in sessions:
-        _hydrate_session_from_manifest(session_id)
-    if session_id not in sessions:
+    sid = _canon_session_id(session_id)
+    if sid not in sessions:
+        _hydrate_session_from_manifest(sid)
+    if sid not in sessions:
         return {
             "status": "idle",
             "session_lost": True,
@@ -257,8 +250,8 @@ async def get_session_state(session_id: str):
             "ppt_url": None,
             "version": 0,
         }
-    s = sessions[session_id]
-    return _session_poll_snapshot(session_id, s)
+    s = sessions[sid]
+    return _session_poll_snapshot(sid, s)
 
 
 def _public_upload_url(session_id: str, disk_fname: str) -> str:
@@ -273,29 +266,37 @@ def _public_processed_url(session_id: str, image_id: str) -> str:
 @app.get("/api/sessions/{session_id}/file/upload/{filename}")
 async def serve_session_upload(session_id: str, filename: str):
     """Serve original upload bytes (no in-memory session required; path must exist on this host)."""
-    _assert_valid_session_dir_name(session_id)
+    sid = _canon_session_id(session_id)
+    _assert_valid_session_dir_name(sid)
     raw = unquote(filename)
     if "/" in raw or "\\" in raw or raw.startswith(".."):
         raise HTTPException(400, "Invalid filename")
     name = Path(raw).name
-    path = (UPLOAD_DIR / session_id / name).resolve()
-    base = (UPLOAD_DIR / session_id).resolve()
-    if not str(path).startswith(str(base)) or not path.is_file():
-        raise HTTPException(404)
-    return FileResponse(path, filename=name)
+    path = (UPLOAD_DIR / sid / name).resolve()
+    base = (UPLOAD_DIR / sid).resolve()
+    if str(path).startswith(str(base)) and path.is_file():
+        return FileResponse(path, filename=name)
+    remote = persistence.lookup_original_public_url(sid, name)
+    if remote:
+        return RedirectResponse(remote, status_code=302)
+    raise HTTPException(404)
 
 
 @app.get("/api/sessions/{session_id}/file/processed/{image_id}")
 async def serve_session_processed(session_id: str, image_id: str):
     """Serve processed JPEG for an image id (no in-memory session required)."""
-    _assert_valid_session_dir_name(session_id)
+    sid = _canon_session_id(session_id)
+    _assert_valid_session_dir_name(sid)
     if not re.match(r"^[0-9a-fA-F]{8}$", image_id):
         raise HTTPException(400, "Invalid image id")
-    path = (OUTPUT_DIR / session_id / "processed" / f"{image_id}_processed.jpg").resolve()
-    base = (OUTPUT_DIR / session_id / "processed").resolve()
-    if not str(path).startswith(str(base)) or not path.is_file():
-        raise HTTPException(404)
-    return FileResponse(path, media_type="image/jpeg", filename=f"{image_id}_processed.jpg")
+    path = (OUTPUT_DIR / sid / "processed" / f"{image_id}_processed.jpg").resolve()
+    base = (OUTPUT_DIR / sid / "processed").resolve()
+    if str(path).startswith(str(base)) and path.is_file():
+        return FileResponse(path, media_type="image/jpeg", filename=f"{image_id}_processed.jpg")
+    remote = persistence.lookup_processed_public_url(sid, image_id)
+    if remote:
+        return RedirectResponse(remote, status_code=302)
+    raise HTTPException(404)
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -303,6 +304,7 @@ async def serve_session_processed(session_id: str, image_id: str):
 @app.post("/api/sessions/{session_id}/upload")
 async def upload_images(session_id: str, files: List[UploadFile] = File(...)):
     s = _require_session(session_id)
+    sid = s.id
     uploaded = []
 
     for file in files:
@@ -316,7 +318,7 @@ async def upload_images(session_id: str, files: List[UploadFile] = File(...)):
         img_id = str(uuid.uuid4())[:8]
         ext = Path(file.filename).suffix or ".jpg"
         fname = f"{img_id}{ext}"
-        fpath = UPLOAD_DIR / session_id / fname
+        fpath = UPLOAD_DIR / sid / fname
 
         async with aiofiles.open(fpath, "wb") as f:
             await f.write(content)
@@ -326,17 +328,27 @@ async def upload_images(session_id: str, files: List[UploadFile] = File(...)):
             filename=file.filename,
             original_path=str(fpath),
         )
+        if blob_enabled():
+            try:
+                ctype = file.content_type or mimetypes.guess_type(fname)[0] or "image/jpeg"
+                pathname = f"garment-catalog/{sid}/original/{fname}"
+                meta = await asyncio.to_thread(blob_put, pathname, content, ctype)
+                item.original_public_url = meta.get("url")
+            except Exception:
+                log.exception("blob upload failed session=%s fname=%s", sid, fname)
+
         s.images[img_id] = item
         uploaded.append(img_id)
 
-        await manager.send_event(session_id, "image_uploaded", {
+        thumb = item.original_public_url or _public_upload_url(sid, fname)
+        await manager.send_event(sid, "image_uploaded", {
             "image_id":  img_id,
             "filename":  file.filename,
             "status":    "uploaded",
-            "thumbnail": _public_upload_url(session_id, fname),
+            "thumbnail": thumb,
         })
 
-    _save_session_manifest(s)   # persist so a hot-reload doesn't lose the upload
+    persistence.save_session(s)
     return {"uploaded": uploaded, "total": len(s.images)}
 
 
@@ -350,6 +362,7 @@ async def start_processing(session_id: str, background_tasks: BackgroundTasks):
     if s.status == "processing":
         raise HTTPException(400, "Already processing")
     s.status = "processing"
+    persistence.save_session(s)
     background_tasks.add_task(run_pipeline, s, manager)
     return {"status": "started", "images": len(s.images)}
 
@@ -385,6 +398,7 @@ async def reclassify_image(session_id: str, image_id: str, body: dict):
         "image_type": img.image_type.value if img.image_type else "unknown",
         "group_id":   new_group,
     })
+    persistence.save_session(s)
     return {"ok": True}
 
 
@@ -429,11 +443,14 @@ async def retry_image(session_id: str, image_id: str, background_tasks: Backgrou
 @app.get("/api/sessions/{session_id}/download")
 async def download_ppt(session_id: str):
     s = _require_session(session_id)
+    pub = getattr(s, "ppt_public_url", None)
+    if pub:
+        return RedirectResponse(pub, status_code=302)
     if not s.ppt_path or not Path(s.ppt_path).exists():
         raise HTTPException(400, "PPT not yet generated")
     return FileResponse(
         s.ppt_path,
-        filename=f"garment_catalog_{session_id}_v{s.version}.pptx",
+        filename=f"garment_catalog_{_canon_session_id(session_id)}_v{s.version}.pptx",
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
     )
 
@@ -451,19 +468,20 @@ async def get_slide_list(session_id: str):
             "garment_data": g.garment_data.model_dump() if g.garment_data else {},
             "image_count":  len(g.images),
         })
-    return {"groups": groups_data, "ppt_ready": s.ppt_path is not None}
+    return {"groups": groups_data, "ppt_ready": s.ppt_path is not None or bool(getattr(s, "ppt_public_url", None))}
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws/{session_id}")
 async def ws_endpoint(websocket: WebSocket, session_id: str):
-    await manager.connect(websocket, session_id)
+    sid = _canon_session_id(session_id)
+    await manager.connect(websocket, sid)
     try:
         # Send current session state on connect
-        if session_id in sessions:
-            s = sessions[session_id]
-            await manager.send_event(session_id, "session_state", {
+        if sid in sessions:
+            s = sessions[sid]
+            await manager.send_event(sid, "session_state", {
                 "status":         s.status,
                 "images":         {k: json.loads(v.model_dump_json()) for k, v in s.images.items()},
                 "groups":         {k: json.loads(v.model_dump_json()) for k, v in s.groups.items()},
@@ -480,7 +498,7 @@ async def ws_endpoint(websocket: WebSocket, session_id: str):
             except Exception:
                 pass
     except WebSocketDisconnect:
-        manager.disconnect(websocket, session_id)
+        manager.disconnect(websocket, sid)
 
 
 # ── Static files ──────────────────────────────────────────────────────────────
@@ -505,48 +523,36 @@ def _require_session(session_id: str) -> Session:
     Load session for a mutating request. Uses 503 (not 404) when the session is missing
     after hydrate — on serverless, another instance may hold the in-memory session.
     """
-    if session_id not in sessions:
-        _hydrate_session_from_manifest(session_id)
-    if session_id not in sessions:
+    sid = _canon_session_id(session_id)
+    if sid not in sessions:
+        _hydrate_session_from_manifest(sid)
+    if sid not in sessions:
         raise HTTPException(
             503,
             detail="Session not available on this server instance. Retry shortly or refresh the page.",
         )
-    return sessions[session_id]
+    return sessions[sid]
 
 
 def _get_session(session_id: str) -> Session:
-    if session_id not in sessions:
-        _hydrate_session_from_manifest(session_id)
-    if session_id not in sessions:
+    sid = _canon_session_id(session_id)
+    if sid not in sessions:
+        _hydrate_session_from_manifest(sid)
+    if sid not in sessions:
         raise HTTPException(404, f"Session '{session_id}' not found")
-    return sessions[session_id]
+    return sessions[sid]
 
 
 def _hydrate_session_from_manifest(session_id: str) -> None:
-    """Re-load a session from disk when it is missing from memory (warm container / recovery)."""
-    if session_id in sessions:
+    """Re-load a session from Redis (full) or disk manifest when missing from memory."""
+    sid = _canon_session_id(session_id)
+    if sid in sessions:
         return
-    manifest = _manifest_path(session_id)
-    if not manifest.exists():
-        return
-    try:
-        data = json.loads(manifest.read_text(encoding="utf-8"))
-        if str(data.get("id", "")).upper() != str(session_id).upper():
-            return
-        session = Session(id=session_id)
-        session.status = data.get("status", "idle")
-        for img_id, img_data in data.get("images", {}).items():
-            path = img_data.get("original_path", "")
-            if path and Path(path).exists():
-                session.images[img_id] = ImageItem(
-                    id=img_data["id"],
-                    filename=img_data["filename"],
-                    original_path=path,
-                )
-        sessions[session_id] = session
-    except Exception:
-        log.exception("hydrate session %s from manifest failed", session_id)
+    s = persistence.load_session_any(sid)
+    if s:
+        if s.id != sid:
+            s.id = sid
+        sessions[sid] = s
 
 
 if __name__ == "__main__":
