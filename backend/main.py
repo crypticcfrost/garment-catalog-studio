@@ -1,9 +1,11 @@
 import logging
 import os
+import re
 import uuid
 import json
 from pathlib import Path
 from typing import Callable, List
+from urllib.parse import quote, unquote
 
 import aiofiles
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
@@ -204,9 +206,9 @@ def _session_poll_snapshot(session_id: str, s: Session) -> dict:
             "error_message": img.error_message,
             "description": img.description,
             "colors": img.colors or [],
-            "preview_url": f"/uploads/{session_id}/{fname}",
+            "preview_url": _public_upload_url(session_id, fname),
             "processed_url": (
-                f"/outputs/{session_id}/processed/{iid}_processed.jpg"
+                _public_processed_url(session_id, iid)
                 if img.processed_path
                 else None
             ),
@@ -241,6 +243,43 @@ async def get_session_state(session_id: str):
     """Full session snapshot for clients that cannot use WebSockets (e.g. Vercel serverless)."""
     s = _get_session(session_id)
     return _session_poll_snapshot(session_id, s)
+
+
+def _public_upload_url(session_id: str, disk_fname: str) -> str:
+    """Browser URL for an uploaded file (served via API so Vercel routes hit Python)."""
+    return f"/api/sessions/{session_id}/file/upload/{quote(disk_fname, safe='')}"
+
+
+def _public_processed_url(session_id: str, image_id: str) -> str:
+    return f"/api/sessions/{session_id}/file/processed/{image_id}"
+
+
+@app.get("/api/sessions/{session_id}/file/upload/{filename}")
+async def serve_session_upload(session_id: str, filename: str):
+    """Serve original upload bytes (path stays under /api/… for full-stack hosts)."""
+    s = _get_session(session_id)
+    raw = unquote(filename)
+    if "/" in raw or "\\" in raw or raw.startswith(".."):
+        raise HTTPException(400, "Invalid filename")
+    name = Path(raw).name
+    path = (UPLOAD_DIR / session_id / name).resolve()
+    base = (UPLOAD_DIR / session_id).resolve()
+    if not str(path).startswith(str(base)) or not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path, filename=name)
+
+
+@app.get("/api/sessions/{session_id}/file/processed/{image_id}")
+async def serve_session_processed(session_id: str, image_id: str):
+    """Serve processed JPEG for an image id."""
+    s = _get_session(session_id)
+    if not re.match(r"^[0-9a-fA-F]{8}$", image_id):
+        raise HTTPException(400, "Invalid image id")
+    path = (OUTPUT_DIR / session_id / "processed" / f"{image_id}_processed.jpg").resolve()
+    base = (OUTPUT_DIR / session_id / "processed").resolve()
+    if not str(path).startswith(str(base)) or not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path, media_type="image/jpeg", filename=f"{image_id}_processed.jpg")
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -278,7 +317,7 @@ async def upload_images(session_id: str, files: List[UploadFile] = File(...)):
             "image_id":  img_id,
             "filename":  file.filename,
             "status":    "uploaded",
-            "thumbnail": f"/uploads/{session_id}/{fname}",
+            "thumbnail": _public_upload_url(session_id, fname),
         })
 
     _save_session_manifest(s)   # persist so a hot-reload doesn't lose the upload

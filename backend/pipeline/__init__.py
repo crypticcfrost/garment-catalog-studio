@@ -236,7 +236,7 @@ async def _step_process(session: Session, manager: ConnectionManager):
             img.status = ImageStatus.PROCESSED
             await _emit(manager, session.id, "image_processed", {
                 "image_id":    img_id,
-                "processed_url": f"/outputs/{session.id}/processed/{img_id}_processed.jpg",
+                "processed_url": f"/api/sessions/{session.id}/file/processed/{img_id}",
                 "status":      "processed",
             })
         except Exception as e:

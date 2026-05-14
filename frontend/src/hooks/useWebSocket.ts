@@ -192,9 +192,8 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
       if (data.images) {
         const imgs = data.images as Record<string, Record<string, unknown>>
         for (const [id, img] of Object.entries(imgs)) {
-          const thumb = img.original_path
-            ? `/uploads/${store.sessionId}/${(img.original_path as string).split('/').pop()}`
-            : ''
+          const fname = (img.original_path as string).split(/[/\\]/).pop() ?? ''
+          const thumb = `/api/sessions/${store.sessionId}/file/upload/${encodeURIComponent(fname)}`
           store.addImage({
             id,
             filename: img.filename as string,
@@ -229,11 +228,15 @@ function handleEvent(event: { type: string; data: Record<string, unknown> }, sto
     }
 
     case 'image_uploaded': {
-      const thumb = `/uploads/${store.sessionId}/${(data.thumbnail as string)?.split('/').pop() ?? ''}`
+      const pop = (data.thumbnail as string)?.split('/').pop() ?? ''
+      const fallback =
+        pop && !String(data.thumbnail || '').startsWith('/api/')
+          ? `/api/sessions/${store.sessionId}/file/upload/${encodeURIComponent(pop)}`
+          : ''
       store.addImage({
         id: data.image_id as string,
         filename: data.filename as string,
-        previewUrl: (data.thumbnail as string) || thumb,
+        previewUrl: (data.thumbnail as string) || fallback,
         status: 'uploaded',
         confidence: 0,
       } as ImageItem)

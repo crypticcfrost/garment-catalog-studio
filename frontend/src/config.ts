@@ -31,13 +31,31 @@ export function apiUrl(path: string | undefined | null): string {
   return `${API_BASE}${p}`
 }
 
+/** Map legacy /uploads and /outputs paths to API file routes (works behind Vercel /_/backend). */
+function upgradeMediaPath(path: string): string {
+  const up = /^\/uploads\/([^/]+)\/([^/]+)$/
+  const m = path.match(up)
+  if (m) {
+    const sid = m[1]
+    const fn = encodeURIComponent(m[2])
+    return `/api/sessions/${sid}/file/upload/${fn}`
+  }
+  const op = /^\/outputs\/([^/]+)\/processed\/([0-9a-fA-F]{8})_processed\.jpg$/
+  const m2 = path.match(op)
+  if (m2) {
+    return `/api/sessions/${m2[1]}/file/processed/${m2[2]}`
+  }
+  return path
+}
+
 /** Image preview / processed path from the store (relative or absolute). */
 export function mediaUrl(path: string | undefined | null): string | undefined {
   if (!path) return undefined
   if (path.startsWith('blob:') || path.startsWith('http://') || path.startsWith('https://')) {
     return path
   }
-  return apiUrl(path)
+  const upgraded = upgradeMediaPath(path.startsWith('/') ? path : `/${path}`)
+  return apiUrl(upgraded)
 }
 
 /** WebSocket URL for pipeline events (`/ws/{sessionId}` on the backend). */
